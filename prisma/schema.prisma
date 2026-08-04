@@ -1,0 +1,75 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ModuleKey {
+  POS
+  KITCHEN
+  PRODUCTS
+  CUSTOMERS
+  HR
+  ROOMS
+  STORE
+  BAR_LOUNGE
+  HOUSEKEEPING
+  RESERVATIONS
+  ACCOUNTING
+  REPORTS
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  OWNER
+  MANAGER
+  STAFF
+}
+
+model Tenant {
+  id            String         @id @default(cuid())
+  name          String
+  slug          String         @unique
+  isActive      Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  users         User[]
+  tenantModules TenantModule[]
+}
+
+model Module {
+  key           ModuleKey      @id
+  name          String
+  description   String?
+  tenantModules TenantModule[]
+}
+
+model TenantModule {
+  id        String    @id @default(cuid())
+  tenantId  String
+  moduleKey ModuleKey
+  isEnabled Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  module    Module    @relation(fields: [moduleKey], references: [key])
+
+  @@unique([tenantId, moduleKey])
+}
+
+model User {
+  id        String   @id @default(cuid())
+  tenantId  String
+  email     String
+  password  String
+  firstName String
+  lastName  String
+  role      UserRole @default(STAFF)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, email])
+}
