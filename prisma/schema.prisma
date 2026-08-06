@@ -28,6 +28,43 @@ enum UserRole {
   STAFF
 }
 
+enum DrinkTemperature {
+  HOT
+  COLD
+  OTHER
+}
+
+enum RoomStatus {
+  VACANT
+  OCCUPIED
+  OUT_OF_SERVICE
+}
+
+enum ReservationStatus {
+  BOOKED
+  CHECKED_IN
+  CHECKED_OUT
+  CANCELLED
+}
+
+enum RoomCleanliness {
+  CLEAN
+  DIRTY
+  INSPECTING
+}
+
+enum HousekeepingTaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum HousekeepingTaskType {
+  CLEANING
+  INSPECTION
+  MAINTENANCE
+}
+
 model Tenant {
   id            String         @id @default(cuid())
   name          String
@@ -37,6 +74,167 @@ model Tenant {
   updatedAt     DateTime       @updatedAt
   users         User[]
   tenantModules TenantModule[]
+  cafeSettings  CafeSettings?
+  stores        Store[]
+  inventoryItems InventoryItem[]
+  menuCategories MenuCategory[]
+  menuItems      MenuItem[]
+  customers      Customer[]
+  rooms          Room[]
+  reservations   Reservation[]
+  housekeepingTasks HousekeepingTask[]
+}
+
+model Customer {
+  id           String        @id @default(cuid())
+  tenantId     String
+  firstName    String
+  lastName     String
+  email        String?
+  phone        String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservations Reservation[]
+
+  @@index([tenantId, lastName, firstName])
+}
+
+model Room {
+  id           String        @id @default(cuid())
+  tenantId     String
+  number       String
+  name         String?
+  type         String
+  capacity     Int           @default(2)
+  nightlyRate  Decimal       @db.Decimal(12, 2)
+  status       RoomStatus    @default(VACANT)
+  cleanliness  RoomCleanliness @default(CLEAN)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservations Reservation[]
+  housekeepingTasks HousekeepingTask[]
+
+  @@unique([tenantId, number])
+}
+
+model HousekeepingTask {
+  id          String                 @id @default(cuid())
+  tenantId    String
+  roomId      String
+  type        HousekeepingTaskType   @default(CLEANING)
+  status      HousekeepingTaskStatus @default(PENDING)
+  assignedTo  String?
+  notes       String?
+  dueAt       DateTime?
+  completedAt DateTime?
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+  tenant      Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  room        Room                   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, status])
+  @@index([tenantId, roomId])
+}
+
+model Reservation {
+  id          String            @id @default(cuid())
+  tenantId    String
+  customerId  String
+  roomId      String
+  checkIn     DateTime
+  checkOut    DateTime
+  adults      Int               @default(1)
+  children    Int               @default(0)
+  status      ReservationStatus @default(BOOKED)
+  notes       String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  tenant      Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer    Customer          @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  room        Room              @relation(fields: [roomId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, checkIn, checkOut])
+  @@index([tenantId, roomId, status])
+}
+
+model CafeSettings {
+  id               String   @id @default(cuid())
+  tenantId         String   @unique
+  cafeName         String
+  currency         String   @default("KES")
+  inventoryEnabled Boolean  @default(true)
+  lowStockAlerts   Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+model Store {
+  id        String          @id @default(cuid())
+  tenantId  String
+  name      String
+  code      String
+  isActive  Boolean         @default(true)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  items     InventoryItem[]
+
+  @@unique([tenantId, code])
+}
+
+model InventoryItem {
+  id           String   @id @default(cuid())
+  tenantId     String
+  storeId      String
+  name         String
+  sku          String
+  unit         String   @default("each")
+  quantity     Decimal  @default(0) @db.Decimal(12, 3)
+  reorderLevel Decimal  @default(0) @db.Decimal(12, 3)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  store        Store    @relation(fields: [storeId], references: [id], onDelete: Restrict)
+  menuItems    MenuItem[]
+
+  @@unique([tenantId, sku])
+  @@index([tenantId, storeId])
+}
+
+model MenuCategory {
+  id        String     @id @default(cuid())
+  tenantId  String
+  name      String
+  sortOrder Int        @default(0)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  items     MenuItem[]
+
+  @@unique([tenantId, name])
+}
+
+model MenuItem {
+  id              String           @id @default(cuid())
+  tenantId        String
+  categoryId      String
+  inventoryItemId String?
+  name            String
+  description     String?
+  price           Decimal          @db.Decimal(12, 2)
+  temperature     DrinkTemperature @default(OTHER)
+  isAvailable     Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category        MenuCategory     @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  inventoryItem   InventoryItem?   @relation(fields: [inventoryItemId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, categoryId])
 }
 
 model Module {
