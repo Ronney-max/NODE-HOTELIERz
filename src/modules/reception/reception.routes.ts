@@ -9,8 +9,9 @@ receptionRouter.use(requireModule("RESERVATIONS"));
 
 const customerSchema = z.object({ firstName: z.string().trim().min(1), lastName: z.string().trim().min(1), email: z.email().optional(), phone: z.string().trim().min(5).max(30).optional() });
 const roomSchema = z.object({ number: z.string().trim().min(1).max(20), name: z.string().trim().max(80).optional(), type: z.string().trim().min(2).max(60), capacity: z.coerce.number().int().min(1).max(20).default(2), nightlyRate: z.coerce.number().nonnegative(), status: z.enum(["VACANT", "OCCUPIED", "OUT_OF_SERVICE"]).default("VACANT"), cleanliness: z.enum(["CLEAN", "DIRTY", "INSPECTING"]).default("CLEAN") });
-const reservationSchema = z.object({ customerId: z.string().cuid(), roomId: z.string().cuid(), checkIn: z.coerce.date(), checkOut: z.coerce.date(), adults: z.coerce.number().int().min(1).default(1), children: z.coerce.number().int().min(0).default(0), notes: z.string().trim().max(500).optional() }).refine((value) => value.checkOut > value.checkIn, { message: "Check-out must be after check-in", path: ["checkOut"] });
-const reservationUpdateSchema = reservationSchema.partial().extend({ status: z.enum(["BOOKED", "CHECKED_IN", "CHECKED_OUT", "CANCELLED"]).optional() });
+const reservationFields = z.object({ customerId: z.string().cuid(), roomId: z.string().cuid(), checkIn: z.coerce.date(), checkOut: z.coerce.date(), adults: z.coerce.number().int().min(1).default(1), children: z.coerce.number().int().min(0).default(0), notes: z.string().trim().max(500).optional() });
+const reservationSchema = reservationFields.refine((value) => value.checkOut > value.checkIn, { message: "Check-out must be after check-in", path: ["checkOut"] });
+const reservationUpdateSchema = reservationFields.partial().extend({ status: z.enum(["BOOKED", "CHECKED_IN", "CHECKED_OUT", "CANCELLED"]).optional() });
 
 function tenantId(req: { tenantId?: string }): string { if (!req.tenantId) throw new Error("Tenant context is required"); return req.tenantId; }
 function invalid(res: { status: (code: number) => { json: (value: unknown) => unknown } }, label: string, details: unknown) { return res.status(400).json({ error: `Invalid ${label}`, details }); }
@@ -31,5 +32,24 @@ async function roomIsAvailable(scope: { tenantId: string; roomId: string; checkI
 
 receptionRouter.get("/reservations", async (req, res) => res.json({ reservations: await prisma.reservation.findMany({ where: { tenantId: tenantId(req) }, include: { customer: true, room: true }, orderBy: { checkIn: "asc" } }) }));
 receptionRouter.post("/reservations", async (req, res) => { const data = reservationSchema.safeParse(req.body); if (!data.success) { invalid(res, "reservation", data.error.flatten()); return; } const scope = { tenantId: tenantId(req), ...data.data }; const [customer, room, available] = await Promise.all([prisma.customer.findFirst({ where: { id: scope.customerId, tenantId: scope.tenantId } }), prisma.room.findFirst({ where: { id: scope.roomId, tenantId: scope.tenantId, status: "VACANT", cleanliness: "CLEAN" } }), roomIsAvailable(scope)]); if (!customer || !room) { res.status(400).json({ error: "Choose a clean, vacant room and a customer from this property" }); return; } if (!available) { res.status(409).json({ error: "This room is already booked for those dates" }); return; } res.status(201).json({ reservation: await prisma.reservation.create({ data: scope, include: { customer: true, room: true } }) }); });
-receptionRouter.patch("/reservations/:id", async (req, res) => { const data = reservationUpdateSchema.safeParse(req.body); if (!data.success) { invalid(res, "reservation", data.error.flatten()); return; } const current = await prisma.reservation.findFirst({ where: { id: req.params.id, tenantId: tenantId(req) } }); if (!current) { res.status(404).json({ error: "Reservation not found" }); return; } const next = { ...current, ...data.data }; if (next.checkOut <= next.checkIn) { res.status(400).json({ error: "Check-out must be after check-in" }); return; } if (["BOOKED", "CHECKED_IN"].includes(next.status) && !(await roomIsAvailable({ tenantId: current.tenantId, roomId: next.roomId, checkIn: next.checkIn, checkOut: next.checkOut, excludeId: current.id }))) { res.status(409).json({ error: "This room is already booked for those dates" }); return; } const reservation = await prisma.reservation.update({ where: { id: current.id }, data: data.data, include: { customer: true, room: true } }); if (data.data.status === "CHECKED_IN") await prisma.room.update({ where: { id: reservation.roomId }, data: { status: "OCCUPIED" } }); if (["CHECKED_OUT", "CANCELLED"].includes(data.data.status ?? "")) await prisma.room.update({ where: { id: reservation.roomId }, data: { status: "VACANT", cleanliness: "DIRTY" } }); res.json({ reservation }); });
+receptionRouter.patch("/reservations/:id", async (req, res) => {
+  const data = reservationUpdateSchema.safeParse(req.body);
+  if (!data.success) { invalid(res, "reservation", data.error.flatten()); return; }
+  const current = await prisma.reservation.findFirst({ where: { id: req.params.id, tenantId: tenantId(req) } });
+  if (!current) { res.status(404).json({ error: "Reservation not found" }); return; }
+  const next = { ...current, ...data.data };
+  if (next.checkOut <= next.checkIn) { res.status(400).json({ error: "Check-out must be after check-in" }); return; }
+  if (["BOOKED", "CHECKED_IN"].includes(next.status) && !(await roomIsAvailable({ tenantId: current.tenantId, roomId: next.roomId, checkIn: next.checkIn, checkOut: next.checkOut, excludeId: current.id }))) { res.status(409).json({ error: "This room is already booked for those dates" }); return; }
+  const reservation = await prisma.$transaction(async (tx) => {
+    const updated = await tx.reservation.update({ where: { id: current.id }, data: data.data, include: { customer: true, room: true } });
+    if (data.data.status === "CHECKED_IN") await tx.room.update({ where: { id: updated.roomId }, data: { status: "OCCUPIED" } });
+    if (["CHECKED_OUT", "CANCELLED"].includes(data.data.status ?? "")) {
+      await tx.room.update({ where: { id: updated.roomId }, data: { status: "VACANT", cleanliness: "DIRTY" } });
+      const activeTask = await tx.housekeepingTask.findFirst({ where: { roomId: updated.roomId, status: { in: ["PENDING", "IN_PROGRESS"] }, type: "CLEANING" } });
+      if (!activeTask) await tx.housekeepingTask.create({ data: { tenantId: current.tenantId, roomId: updated.roomId, type: "CLEANING", notes: `Automatic turnover after ${updated.customer.firstName} ${updated.customer.lastName} checked out` } });
+    }
+    return updated;
+  });
+  res.json({ reservation });
+});
 receptionRouter.delete("/reservations/:id", async (req, res) => { const reservation = await prisma.reservation.deleteMany({ where: { id: req.params.id, tenantId: tenantId(req) } }); if (!reservation.count) { res.status(404).json({ error: "Reservation not found" }); return; } res.status(204).send(); });

@@ -13,7 +13,42 @@ export function tenantContext(req: Request, _res: Response, next: NextFunction):
   if (tenantId) {
     req.tenantId = tenantId;
   }
+  const userId = req.header("x-user-id");
+  if (userId) {
+    req.userId = userId;
+  }
   next();
+}
+
+/**
+ * Temporary role guard until session/JWT authentication is introduced.
+ * The acting staff member is resolved from x-user-id within the current tenant;
+ * only active owners and super admins may perform protected operations.
+ */
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (!req.tenantId || !req.userId) {
+    res.status(401).json({ error: "An authenticated admin user is required" });
+    return;
+  }
+
+  prisma.user
+    .findFirst({
+      where: {
+        id: req.userId,
+        tenantId: req.tenantId,
+        isActive: true,
+        role: { in: ["SUPER_ADMIN", "OWNER"] },
+      },
+      select: { id: true },
+    })
+    .then((admin) => {
+      if (!admin) {
+        res.status(403).json({ error: "Only a main admin can delete stores" });
+        return;
+      }
+      next();
+    })
+    .catch(next);
 }
 
 /**
