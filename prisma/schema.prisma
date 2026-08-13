@@ -26,6 +26,10 @@ enum UserRole {
   OWNER
   MANAGER
   STAFF
+  BARISTA
+  STORE_KEEPER
+  RECEPTIONIST
+  HOUSEKEEPER
 }
 
 enum DrinkTemperature {
@@ -65,6 +69,20 @@ enum HousekeepingTaskType {
   MAINTENANCE
 }
 
+enum InventoryMovementType {
+  RECEIPT
+  DISPATCH
+  ADJUSTMENT
+}
+
+enum PosOrderStatus {
+  OPEN
+  PREPARING
+  READY
+  COMPLETED
+  CANCELLED
+}
+
 model Tenant {
   id            String         @id @default(cuid())
   name          String
@@ -77,10 +95,14 @@ model Tenant {
   cafeSettings  CafeSettings?
   stores        Store[]
   inventoryItems InventoryItem[]
+  inventoryMovements InventoryMovement[]
+  posOrders      PosOrder[]
+  addons         Addon[]
   menuCategories MenuCategory[]
   menuItems      MenuItem[]
   customers      Customer[]
   rooms          Room[]
+  roomTypes      RoomType[]
   reservations   Reservation[]
   housekeepingTasks HousekeepingTask[]
 }
@@ -119,6 +141,23 @@ model Room {
   @@unique([tenantId, number])
 }
 
+model RoomType {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  capacity    Int      @default(2)
+  baseRate    Decimal  @db.Decimal(12, 2)
+  amenities   String[] @default([])
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, name])
+  @@index([tenantId, isActive])
+}
+
 model HousekeepingTask {
   id          String                 @id @default(cuid())
   tenantId    String
@@ -154,6 +193,7 @@ model Reservation {
   tenant      Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   customer    Customer          @relation(fields: [customerId], references: [id], onDelete: Restrict)
   room        Room              @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  posOrders   PosOrder[]
 
   @@index([tenantId, checkIn, checkOut])
   @@index([tenantId, roomId, status])
@@ -181,6 +221,7 @@ model Store {
   updatedAt DateTime        @updatedAt
   tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   items     InventoryItem[]
+  movements InventoryMovement[]
 
   @@unique([tenantId, code])
 }
@@ -200,9 +241,30 @@ model InventoryItem {
   tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   store        Store    @relation(fields: [storeId], references: [id], onDelete: Restrict)
   menuItems    MenuItem[]
+  movements    InventoryMovement[]
+  menuIngredients MenuItemIngredient[]
 
   @@unique([tenantId, sku])
   @@index([tenantId, storeId])
+}
+
+model InventoryMovement {
+  id              String                @id @default(cuid())
+  tenantId        String
+  inventoryItemId String
+  storeId         String
+  type            InventoryMovementType
+  quantity        Decimal               @db.Decimal(12, 3)
+  note            String?
+  performedBy     String?
+  occurredAt      DateTime              @default(now())
+  createdAt       DateTime              @default(now())
+  tenant          Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  inventoryItem   InventoryItem         @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+  store           Store                 @relation(fields: [storeId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, inventoryItemId, occurredAt])
+  @@index([tenantId, storeId, occurredAt])
 }
 
 model MenuCategory {
@@ -233,8 +295,86 @@ model MenuItem {
   tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   category        MenuCategory     @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   inventoryItem   InventoryItem?   @relation(fields: [inventoryItemId], references: [id], onDelete: SetNull)
+  ingredients     MenuItemIngredient[]
+  orderItems      PosOrderItem[]
 
   @@index([tenantId, categoryId])
+}
+
+model PosOrder {
+  id          String         @id @default(cuid())
+  tenantId    String
+  reservationId String?
+  orderNumber Int
+  tableLabel  String?
+  status      PosOrderStatus @default(OPEN)
+  notes       String?
+  readyAt     DateTime?
+  servedAt    DateTime?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservation Reservation?   @relation(fields: [reservationId], references: [id], onDelete: SetNull)
+  items       PosOrderItem[]
+
+  @@unique([tenantId, orderNumber])
+  @@index([tenantId, status, createdAt])
+  @@index([reservationId])
+}
+
+model PosOrderItem {
+  id         String   @id @default(cuid())
+  orderId    String
+  menuItemId String
+  quantity   Int      @default(1)
+  unitPrice  Decimal  @db.Decimal(12, 2)
+  createdAt  DateTime @default(now())
+  order      PosOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+  addons     PosOrderItemAddon[]
+
+  @@index([orderId])
+}
+
+model Addon {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  price     Decimal  @db.Decimal(12, 2)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  orderItems PosOrderItemAddon[]
+
+  @@unique([tenantId, name])
+}
+
+model PosOrderItemAddon {
+  id          String       @id @default(cuid())
+  orderItemId String
+  addonId     String
+  quantity    Int          @default(1)
+  unitPrice   Decimal      @db.Decimal(12, 2)
+  createdAt   DateTime     @default(now())
+  orderItem   PosOrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  addon       Addon        @relation(fields: [addonId], references: [id], onDelete: Restrict)
+
+  @@index([orderItemId])
+}
+
+model MenuItemIngredient {
+  id              String        @id @default(cuid())
+  menuItemId      String
+  inventoryItemId String
+  quantity        Decimal       @db.Decimal(12, 3)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  menuItem        MenuItem      @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Restrict)
+
+  @@unique([menuItemId, inventoryItemId])
+  @@index([inventoryItemId])
 }
 
 model Module {
