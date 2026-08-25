@@ -19,7 +19,7 @@ const tenant = await prisma.tenant.upsert({
   create: { name: "HOTELIER Demo", slug: "hotelier-demo", ...licenseFields },
 });
 
-for (const moduleKey of ["PRODUCTS", "STORE", "POS", "KITCHEN", "ROOMS", "RESERVATIONS", "HOUSEKEEPING", "HR"] as const) {
+for (const moduleKey of ["PRODUCTS", "STORE", "POS", "KITCHEN", "ROOMS", "RESERVATIONS", "HOUSEKEEPING", "HR", "REPORTS", "CUSTOMERS"] as const) {
   await prisma.module.upsert({
     where: { key: moduleKey },
     update: {},
@@ -77,16 +77,16 @@ await prisma.employee.upsert({
   },
 });
 
-for (const store of [
-  { name: "Main Store", code: "MAIN" },
-  { name: "Bakery Store", code: "BAKERY" },
-]) {
-  await prisma.store.upsert({
-    where: { tenantId_code: { tenantId: tenant.id, code: store.code } },
-    update: { name: store.name, isActive: true },
-    create: { tenantId: tenant.id, ...store },
-  });
-}
+// A warehouse is just a Location of type STORE — no separate store model.
+// canSell* all false since it doesn't run its own POS.
+await prisma.location.upsert({
+  where: { tenantId_name: { tenantId: tenant.id, name: "Main Store" } },
+  update: {},
+  create: {
+    tenantId: tenant.id, name: "Main Store", type: "STORE", isActive: true,
+    canSellRooms: false, canSellMenu: false, canSellServices: false, canSellProducts: false,
+  },
+});
 
 await prisma.cafeSettings.upsert({
   where: { tenantId: tenant.id },
@@ -94,6 +94,7 @@ await prisma.cafeSettings.upsert({
   create: { tenantId: tenant.id, cafeName: "TANZ Café", currency: "KES" },
 });
 
+const roomTypeIds = new Map<string, string>();
 for (const roomType of [
   { name: "Standard Single", description: "Comfortable room for one guest", capacity: 1, baseRate: 4500, amenities: ["Wi-Fi", "Desk", "Shower"] },
   { name: "Standard Double", description: "Practical double room for couples or solo travellers", capacity: 2, baseRate: 5500, amenities: ["Wi-Fi", "Double bed", "Shower", "Desk"] },
@@ -110,7 +111,25 @@ for (const roomType of [
   { name: "Presidential Suite", description: "Signature luxury suite for VIP stays", capacity: 4, baseRate: 30000, amenities: ["Butler service", "Dining area", "Lounge", "Premium mini bar"] },
   { name: "Penthouse Suite", description: "Top-floor luxury suite with expansive living space", capacity: 6, baseRate: 45000, amenities: ["Private terrace", "Dining room", "Kitchenette", "Butler service"] },
 ]) {
-  await prisma.roomType.upsert({ where: { tenantId_name: { tenantId: tenant.id, name: roomType.name } }, update: {}, create: { tenantId: tenant.id, ...roomType } });
+  const created = await prisma.roomType.upsert({ where: { tenantId_name: { tenantId: tenant.id, name: roomType.name } }, update: {}, create: { tenantId: tenant.id, ...roomType } });
+  roomTypeIds.set(roomType.name, created.id);
+}
+
+// Only "Deluxe King" gets meal-plan rate tiers seeded — realistic (not every
+// property configures every type immediately) and exercises the "no tiers
+// yet" empty state for the other 13 types.
+const deluxeKingId = roomTypeIds.get("Deluxe King")!;
+for (const rate of [
+  { mealPlan: "ROOM_ONLY", price: 7500 },
+  { mealPlan: "BED_AND_BREAKFAST", price: 8500 },
+  { mealPlan: "HALF_BOARD", price: 11000 },
+  { mealPlan: "FULL_BOARD", price: 14000 },
+] as const) {
+  await prisma.roomRate.upsert({
+    where: { roomTypeId_mealPlan: { roomTypeId: deluxeKingId, mealPlan: rate.mealPlan } },
+    update: { price: rate.price },
+    create: { tenantId: tenant.id, roomTypeId: deluxeKingId, mealPlan: rate.mealPlan, price: rate.price },
+  });
 }
 
 for (const room of [
@@ -129,10 +148,61 @@ for (const room of [
   { number: "401", name: "Presidential Residence", type: "Presidential Suite", capacity: 4, nightlyRate: 30000 },
   { number: "501", name: "Sky Penthouse", type: "Penthouse Suite", capacity: 6, nightlyRate: 45000 },
 ]) {
+  const { type, ...roomData } = room;
   await prisma.room.upsert({
-    where: { tenantId_number: { tenantId: tenant.id, number: room.number } },
+    where: { tenantId_number: { tenantId: tenant.id, number: roomData.number } },
     update: {},
-    create: { tenantId: tenant.id, ...room, status: "VACANT", cleanliness: "CLEAN" },
+    create: { tenantId: tenant.id, ...roomData, roomTypeId: roomTypeIds.get(type)!, status: "VACANT", cleanliness: "CLEAN" },
+  });
+}
+
+const serviceCategoryIds = new Map<string, string>();
+for (const name of ["food", "transport", "laundry", "room", "spa", "other"]) {
+  const created = await prisma.serviceCategory.upsert({ where: { tenantId_name: { tenantId: tenant.id, name } }, update: {}, create: { tenantId: tenant.id, name } });
+  serviceCategoryIds.set(name, created.id);
+}
+
+const unitOfMeasureIds = new Map<string, string>();
+for (const name of ["item", "person", "night", "hour", "trip", "kg"]) {
+  const created = await prisma.unitOfMeasure.upsert({ where: { tenantId_name: { tenantId: tenant.id, name } }, update: {}, create: { tenantId: tenant.id, name } });
+  unitOfMeasureIds.set(name, created.id);
+}
+
+for (const service of [
+  { name: "Airport Transfer", category: "transport", unit: "trip", price: 3500, description: "One-way airport pickup or drop-off" },
+  { name: "Extra Bed", category: "room", unit: "night", price: 1500, description: "Rollaway bed added to a room" },
+  { name: "Laundry — Shirt", category: "laundry", unit: "item", price: 200 },
+  { name: "60-Minute Massage", category: "spa", unit: "hour", price: 4500, description: "Full-body relaxation massage" },
+]) {
+  await prisma.service.upsert({
+    where: { tenantId_name: { tenantId: tenant.id, name: service.name } },
+    update: {},
+    create: {
+      tenantId: tenant.id,
+      name: service.name,
+      categoryId: serviceCategoryIds.get(service.category)!,
+      unitId: unitOfMeasureIds.get(service.unit)!,
+      price: service.price,
+      description: service.description,
+    },
+  });
+}
+
+for (const name of ["Transport", "Utilities", "Repairs", "Marketing", "Salary", "Miscellaneous"]) {
+  await prisma.expenseCategory.upsert({ where: { tenantId_name: { tenantId: tenant.id, name } }, update: {}, create: { tenantId: tenant.id, name } });
+}
+
+for (const method of [
+  { name: "Cash", code: "CASH", requiresReference: false, sortOrder: 0 },
+  { name: "M-Pesa", code: "MPESA", requiresReference: true, sortOrder: 1 },
+  { name: "Card", code: "CARD", requiresReference: true, sortOrder: 2 },
+  { name: "Bank Transfer", code: "BANK_TRANSFER", requiresReference: true, sortOrder: 3 },
+  { name: "Cheque", code: "CHEQUE", requiresReference: true, sortOrder: 4 },
+]) {
+  await prisma.paymentMethod.upsert({
+    where: { tenantId_code: { tenantId: tenant.id, code: method.code } },
+    update: {},
+    create: { tenantId: tenant.id, ...method, isSystem: true },
   });
 }
 
@@ -151,17 +221,14 @@ const menu = [
   { category: "Bakery", name: "Chocolate Cake Slice", description: "Dark chocolate cake with ganache", price: 400, temperature: "OTHER" },
 ] as const;
 
-for (const [sortOrder, categoryName] of ["Hot drinks", "Cold drinks", "Bakery"].entries()) {
-  await prisma.menuCategory.upsert({
-    where: { tenantId_name: { tenantId: tenant.id, name: categoryName } },
-    update: { sortOrder },
-    create: { tenantId: tenant.id, name: categoryName, sortOrder },
-  });
+for (const categoryName of ["Hot drinks", "Cold drinks", "Bakery"]) {
+  const existing = await prisma.category.findFirst({ where: { tenantId: tenant.id, scope: "RESTAURANT", parentId: null, name: categoryName } });
+  if (!existing) await prisma.category.create({ data: { tenantId: tenant.id, scope: "RESTAURANT", name: categoryName } });
 }
 
 for (const entry of menu) {
-  const category = await prisma.menuCategory.findUniqueOrThrow({
-    where: { tenantId_name: { tenantId: tenant.id, name: entry.category } },
+  const category = await prisma.category.findFirstOrThrow({
+    where: { tenantId: tenant.id, scope: "RESTAURANT", parentId: null, name: entry.category },
   });
   const existing = await prisma.menuItem.findFirst({ where: { tenantId: tenant.id, name: entry.name } });
   const data = { categoryId: category.id, description: entry.description, price: entry.price, temperature: entry.temperature, isAvailable: true };
@@ -179,6 +246,21 @@ for (const addon of [
     where: { tenantId_name: { tenantId: tenant.id, name: addon.name } },
     update: { price: addon.price, isActive: true },
     create: { tenantId: tenant.id, ...addon },
+  });
+}
+
+for (const table of [
+  { label: "T1", area: "Main Hall", capacity: 2 },
+  { label: "T2", area: "Main Hall", capacity: 2 },
+  { label: "T3", area: "Main Hall", capacity: 4 },
+  { label: "T4", area: "Main Hall", capacity: 4 },
+  { label: "P1", area: "Patio", capacity: 2 },
+  { label: "P2", area: "Patio", capacity: 6 },
+]) {
+  await prisma.table.upsert({
+    where: { tenantId_label: { tenantId: tenant.id, label: table.label } },
+    update: { area: table.area, capacity: table.capacity },
+    create: { tenantId: tenant.id, ...table },
   });
 }
 

@@ -14,6 +14,7 @@ const loginSchema = z.object({
 });
 
 const roleSelect = { select: { id: true, name: true, allowedSections: true } } as const;
+const locationSelect = { select: { id: true, name: true } } as const;
 
 const tenantId = (req: { tenantId?: string }) => {
   if (!req.tenantId) throw new Error("Tenant context is required");
@@ -29,6 +30,7 @@ function bearerToken(req: { header(name: string): string | undefined }): string 
 function publicEmployee(employee: {
   id: string; firstName: string; lastName: string; employeeCode: string; jobTitle: string;
   department: string; role: { id: string; name: string; allowedSections: string[] } | null;
+  location: { id: string; name: string } | null;
 }) {
   return {
     id: employee.id,
@@ -38,6 +40,7 @@ function publicEmployee(employee: {
     jobTitle: employee.jobTitle,
     department: employee.department,
     role: employee.role,
+    location: employee.location,
   };
 }
 
@@ -47,7 +50,7 @@ authRouter.post("/login", async (req, res, next) => {
   try {
     const employee = await prisma.employee.findFirst({
       where: { tenantId: tenantId(req), employeeCode: { equals: data.data.employeeCode, mode: "insensitive" } },
-      include: { role: roleSelect },
+      include: { role: roleSelect, location: locationSelect },
     });
     if (!employee || employee.status !== "ACTIVE" || !verifySecret(data.data.pin, employee.pin)) {
       res.status(401).json({ error: "Incorrect employee code or PIN" });
@@ -65,7 +68,7 @@ authRouter.post("/login", async (req, res, next) => {
 authRouter.get("/me", async (req, res) => {
   const token = bearerToken(req);
   if (!token) { res.status(401).json({ error: "Not authenticated" }); return; }
-  const session = await prisma.session.findUnique({ where: { token }, include: { employee: { include: { role: roleSelect } } } });
+  const session = await prisma.session.findUnique({ where: { token }, include: { employee: { include: { role: roleSelect, location: locationSelect } } } });
   if (!session || session.expiresAt < new Date()) { res.status(401).json({ error: "Session expired" }); return; }
   res.json({ user: publicEmployee(session.employee), tenantId: session.tenantId, expiresAt: session.expiresAt });
 });

@@ -1,3 +1,4 @@
+import path from "node:path";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import express, { type Application } from "express";
@@ -38,6 +39,19 @@ export function createApp(): Application {
 
   app.use(express.json());
   app.use(cookieParser());
+
+  // Scoped CORP relaxation: the global helmet() above defaults to
+  // Cross-Origin-Resource-Policy: same-origin, which would silently block
+  // <img src> loading an uploaded logo when the frontend is served from a
+  // different origin/subdomain than the API (true even in dev: :5173 vs
+  // :4000). This second helmet() call only changes that one header, only
+  // for /uploads responses — every other route keeps the strict default.
+  app.use(
+    "/uploads",
+    helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }),
+    express.static(path.resolve(process.cwd(), "uploads"), { immutable: true, maxAge: "365d" })
+  );
+
   app.use(tenantContext);
 
   app.use("/api", router);

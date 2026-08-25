@@ -25,10 +25,36 @@ tenantRouter.get("/resolve", async (req, res) => {
   if (!query.success) { res.status(400).json({ error: "A workspace slug is required" }); return; }
   const tenant = await prisma.tenant.findFirst({
     where: { slug: query.data.slug, isActive: true },
-    select: { id: true, name: true, slug: true },
+    select: {
+      id: true,
+      name: true,
+      slug: true,
+      businessProfile: {
+        select: {
+          themeBaseColor: true,
+          themeAccentColor: true,
+          themeFont: true,
+          logoUrl: true,
+          shortName: true,
+          businessType: true,
+        },
+      },
+    },
   });
   if (!tenant) { res.status(404).json({ error: "This workspace could not be found" }); return; }
-  res.json({ tenant });
+  res.json({
+    tenant: {
+      id: tenant.id,
+      name: tenant.name,
+      slug: tenant.slug,
+      themeBaseColor: tenant.businessProfile?.themeBaseColor ?? "#1c74d1",
+      themeAccentColor: tenant.businessProfile?.themeAccentColor ?? "#43a047",
+      themeFont: tenant.businessProfile?.themeFont ?? "jost",
+      logoUrl: tenant.businessProfile?.logoUrl ?? null,
+      shortName: tenant.businessProfile?.shortName ?? null,
+      businessType: tenant.businessProfile?.businessType ?? "HOTEL",
+    },
+  });
 });
 
 tenantRouter.get("/license", async (req, res) => {

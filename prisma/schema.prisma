@@ -45,10 +45,12 @@ enum RoomStatus {
 }
 
 enum ReservationStatus {
-  BOOKED
+  PENDING
+  CONFIRMED
   CHECKED_IN
   CHECKED_OUT
   CANCELLED
+  NO_SHOW
 }
 
 enum RoomCleanliness {
@@ -73,14 +75,44 @@ enum InventoryMovementType {
   RECEIPT
   DISPATCH
   ADJUSTMENT
+  TRANSFER
+}
+
+// Which part of the property a category organizes. One shared hierarchy —
+// Store products use STORE, restaurant menu items use RESTAURANT, and so on
+// — so a category tree isn't duplicated per module.
+enum CategoryScope {
+  STORE
+  RESTAURANT
+  BAR
+  GYM
+  SPA
+  ROOMS
+  ASSETS
 }
 
 enum PosOrderStatus {
   OPEN
   PREPARING
   READY
+  SERVED
   COMPLETED
   CANCELLED
+}
+
+// Which catalog/POS screen created this order. PRODUCTS/SERVICES orders
+// have no kitchen step — they're created directly as SERVED.
+enum PosOrderChannel {
+  FOOD
+  PRODUCTS
+  SERVICES
+}
+
+enum TableStatus {
+  AVAILABLE
+  OCCUPIED
+  RESERVED
+  OUT_OF_SERVICE
 }
 
 enum Gender {
@@ -144,11 +176,16 @@ enum SalaryType {
   HOURLY
 }
 
-enum PaymentMethod {
+// Payroll disbursement only — how the business pays a staff member. Kept
+// distinct from the customer-facing PaymentMethod model (opposite direction,
+// different domain); renamed off the bare "PaymentMethod" name once that
+// became the tenant-configurable model below.
+enum EmployeePaymentMethod {
   BANK_TRANSFER
   MPESA
   CASH
   CHEQUE
+  CARD
 }
 
 enum BusinessType {
@@ -171,12 +208,12 @@ enum TaxMode {
 }
 
 model Tenant {
-  id            String         @id @default(cuid())
-  name          String
-  slug          String         @unique
-  isActive      Boolean        @default(true)
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   licenseKey        String        @default(uuid())
   licenseStatus     LicenseStatus @default(TRIAL)
@@ -188,77 +225,281 @@ model Tenant {
   maxDevices        Int           @default(10)
   lastLicenseCheck  DateTime?
 
-  users         User[]
-  tenantModules TenantModule[]
-  cafeSettings  CafeSettings?
-  stores        Store[]
-  categories    Category[]
-  products      Product[]
+  users              User[]
+  tenantModules      TenantModule[]
+  cafeSettings       CafeSettings?
+  categories         Category[]
+  products           Product[]
+  productStocks      ProductStock[]
   inventoryMovements InventoryMovement[]
-  posOrders      PosOrder[]
-  addons         Addon[]
-  menuCategories MenuCategory[]
-  menuItems      MenuItem[]
-  customers      Customer[]
-  rooms          Room[]
-  roomTypes      RoomType[]
-  reservations   Reservation[]
-  housekeepingTasks HousekeepingTask[]
-  employees      Employee[]
-  businessProfile BusinessProfile?
-  roles           Role[]
-  sessions        Session[]
+  posOrders          PosOrder[]
+  addons             Addon[]
+  menuItems          MenuItem[]
+  recipes            Recipe[]
+  tables             Table[]
+  payments           Payment[]
+  locations          Location[]
+  customers          Customer[]
+  tenantSequences    TenantSequence[]
+  reservationGuests  ReservationGuest[]
+  folios             Folio[]
+  folioLineItems     FolioLineItem[]
+  folioPayments      FolioPayment[]
+  rooms              Room[]
+  roomTypes          RoomType[]
+  roomRates          RoomRate[]
+  serviceCategories  ServiceCategory[]
+  unitsOfMeasure     UnitOfMeasure[]
+  services           Service[]
+  reservations       Reservation[]
+  housekeepingTasks  HousekeepingTask[]
+  employees          Employee[]
+  businessProfile    BusinessProfile?
+  roles              Role[]
+  sessions           Session[]
+  paymentMethods     PaymentMethod[]
+  transactions       Transaction[]
+  expenseCategories  ExpenseCategory[]
+  expenses           Expense[]
+  lostFoundItems     LostFoundItem[]
+  reservationActivities ReservationActivity[]
+  assets             Asset[]
+  assetMovements     AssetMovement[]
+}
+
+enum CustomerType {
+  PERSONAL
+  BUSINESS
+}
+
+enum CustomerStatus {
+  ACTIVE
+  INACTIVE
+  BLOCKED
+}
+
+enum PreferredLanguage {
+  ENGLISH
+  SWAHILI
+  OTHER
+}
+
+enum ContactMethod {
+  PHYSICAL
+  CALL
+  WHATSAPP
+  EMAIL
+}
+
+// Generic atomic per-tenant counter — one row per (tenantId, key), e.g.
+// key="customer" backs Customer.customerNo, key="reservation" backs
+// Reservation.reservationNo, key="folio" backs Folio.folioNo. Widened from
+// the original single-purpose CustomerSequence (which used tenantId alone
+// as its PK) once a second and third counter were needed.
+model TenantSequence {
+  id         String @id @default(cuid())
+  tenantId   String
+  key        String
+  tenant     Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  lastNumber Int    @default(0)
+
+  @@unique([tenantId, key])
 }
 
 model Customer {
-  id           String        @id @default(cuid())
+  id           String       @id @default(cuid())
   tenantId     String
-  firstName    String
-  lastName     String
-  email        String?
-  phone        String?
+  customerNo   String
+  customerType CustomerType @default(PERSONAL)
+
+  firstName String
+  lastName  String?
+  email     String?
+  phone     String
+
+  nationality String?
+  idNumber    String? // passport / national ID number
+  occupation  String?
+  gender      Gender?
+  dob         DateTime?
+
+  carModel        String?
+  carRegistration String?
+  carColour       String?
+
+  status  CustomerStatus @default(ACTIVE)
+  address String?
+  notes   String?
+
+  // Business details — usable regardless of customerType, but primarily
+  // relevant when customerType is BUSINESS.
+  businessName       String?
+  registrationNumber String?
+  kraPin             String?
+  contactPerson      String?
+  billingPhone       String?
+  billingEmail       String?
+  website            String?
+
+  // Personal preferences
+  preferredLanguage PreferredLanguage?
+  preferredCurrency Currency?
+  contactMethod     ContactMethod?
+  marketingConsent  Boolean            @default(false)
+  loyaltyPoints     Int                @default(0)
+
+  // Emergency contact
+  emergencyContactName         String?
+  emergencyContactRelationship String?
+  emergencyContactPhone        String?
+
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
+  createdBy    String?
+  updatedBy    String?
+  locationId   String?
   tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   reservations Reservation[]
+  transactions Transaction[]
+  posOrders    PosOrder[]
+  createdByEmployee Employee? @relation("CustomerCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedByEmployee Employee? @relation("CustomerUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+  location          Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
 
+  @@unique([tenantId, customerNo])
   @@index([tenantId, lastName, firstName])
+  @@index([tenantId, status])
 }
 
 model Room {
-  id           String        @id @default(cuid())
-  tenantId     String
-  number       String
-  name         String?
-  type         String
-  capacity     Int           @default(2)
-  nightlyRate  Decimal       @db.Decimal(12, 2)
-  status       RoomStatus    @default(VACANT)
-  cleanliness  RoomCleanliness @default(CLEAN)
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  reservations Reservation[]
+  id                String             @id @default(cuid())
+  tenantId          String
+  number            String
+  name              String?
+  roomTypeId        String
+  floor             String?
+  wing              String?
+  notes             String?
+  capacity          Int                @default(2)
+  nightlyRate       Decimal            @db.Decimal(12, 2)
+  status            RoomStatus         @default(VACANT)
+  cleanliness       RoomCleanliness    @default(CLEAN)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  createdBy         String?
+  updatedBy         String?
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  roomType          RoomType           @relation(fields: [roomTypeId], references: [id], onDelete: Restrict)
+  reservations      Reservation[]
   housekeepingTasks HousekeepingTask[]
+  lostFoundItems    LostFoundItem[]
+  createdByEmployee Employee?          @relation("RoomCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedByEmployee Employee?          @relation("RoomUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
 
   @@unique([tenantId, number])
+  @@index([tenantId, roomTypeId])
+}
+
+enum MealPlan {
+  ROOM_ONLY
+  BED_AND_BREAKFAST
+  HALF_BOARD
+  FULL_BOARD
+}
+
+model RoomRate {
+  id         String   @id @default(cuid())
+  tenantId   String
+  roomTypeId String
+  mealPlan   MealPlan
+  price      Decimal  @db.Decimal(12, 2)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  createdBy  String?
+  updatedBy  String?
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  roomType   RoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
+  createdByEmployee Employee? @relation("RoomRateCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedByEmployee Employee? @relation("RoomRateUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+
+  @@unique([roomTypeId, mealPlan])
+  @@index([tenantId, roomTypeId])
 }
 
 model RoomType {
-  id          String   @id @default(cuid())
+  id          String     @id @default(cuid())
   tenantId    String
   name        String
   description String?
-  capacity    Int      @default(2)
-  baseRate    Decimal  @db.Decimal(12, 2)
-  amenities   String[] @default([])
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  capacity    Int        @default(2)
+  baseRate    Decimal    @db.Decimal(12, 2)
+  amenities   String[]   @default([])
+  isActive    Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  createdBy   String?
+  updatedBy   String?
+  tenant      Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  rooms       Room[]
+  rates       RoomRate[]
+  createdByEmployee Employee? @relation("RoomTypeCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedByEmployee Employee? @relation("RoomTypeUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
 
   @@unique([tenantId, name])
   @@index([tenantId, isActive])
+}
+
+// Deliberately flat, no hierarchy — a conscious contrast to the Category
+// model's parent/child/scope tree used for products/menu items.
+model ServiceCategory {
+  id        String    @id @default(cuid())
+  tenantId  String
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  services  Service[]
+
+  @@unique([tenantId, name])
+}
+
+// A single tenant-wide lookup, used universally wherever a "per X" unit is
+// needed — not scoped to Services specifically.
+model UnitOfMeasure {
+  id        String    @id @default(cuid())
+  tenantId  String
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  services  Service[]
+
+  @@unique([tenantId, name])
+}
+
+model Service {
+  id          String          @id @default(cuid())
+  tenantId    String
+  tenant      Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name        String
+  categoryId  String
+  category    ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  unitId      String
+  unit        UnitOfMeasure   @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  price       Decimal         @db.Decimal(12, 2)
+  description String?
+  isActive    Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  // Empty = unallocated = sellable at every location (the default) —
+  // identical convention to MenuItem.locations.
+  locations   Location[]
+  orderItems  PosOrderItem[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, categoryId])
+  @@index([tenantId, unitId])
 }
 
 model HousekeepingTask {
@@ -273,33 +514,424 @@ model HousekeepingTask {
   completedAt DateTime?
   createdAt   DateTime               @default(now())
   updatedAt   DateTime               @updatedAt
+  createdBy   String?
+  updatedBy   String?
   tenant      Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   room        Room                   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  createdByEmployee Employee?        @relation("HousekeepingTaskCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedByEmployee Employee?        @relation("HousekeepingTaskUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
 
   @@index([tenantId, status])
   @@index([tenantId, roomId])
 }
 
-model Reservation {
-  id          String            @id @default(cuid())
-  tenantId    String
-  customerId  String
-  roomId      String
-  checkIn     DateTime
-  checkOut    DateTime
-  adults      Int               @default(1)
-  children    Int               @default(0)
-  status      ReservationStatus @default(BOOKED)
-  notes       String?
-  createdAt   DateTime          @default(now())
-  updatedAt   DateTime          @updatedAt
-  tenant      Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  customer    Customer          @relation(fields: [customerId], references: [id], onDelete: Restrict)
-  room        Room              @relation(fields: [roomId], references: [id], onDelete: Restrict)
-  posOrders   PosOrder[]
+enum LostFoundStatus {
+  UNCLAIMED
+  COLLECTED
+}
 
+// Recorded by whoever finds an item (usually housekeeping during turnover).
+// Never hard-deleted from being collected — collection is reversible (a
+// mis-click "collect" shouldn't be a dead end) — but a genuine duplicate/
+// mistaken entry can still be deleted outright, since this is an
+// operational log, not a financial ledger.
+model LostFoundItem {
+  id                  String          @id @default(cuid())
+  tenantId            String
+  tenant              Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  itemNo              String
+  itemName            String
+  description         String?
+  roomId              String?
+  room                Room?           @relation(fields: [roomId], references: [id], onDelete: SetNull)
+  locationNote        String?
+  foundAt             DateTime        @default(now())
+  foundBy             String?
+  foundByEmployee     Employee?       @relation("LostFoundFoundBy", fields: [foundBy], references: [id], onDelete: SetNull)
+  status              LostFoundStatus @default(UNCLAIMED)
+  collectedByName     String?
+  collectedByContact  String?
+  collectedAt         DateTime?
+  collectedBy         String?
+  collectedByEmployee Employee?       @relation("LostFoundCollectedBy", fields: [collectedBy], references: [id], onDelete: SetNull)
+  notes               String?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  @@unique([tenantId, itemNo])
+  @@index([tenantId, status])
+  @@index([tenantId, roomId])
+}
+
+enum ReservationSource {
+  WALK_IN
+  PHONE
+  WEBSITE
+  BOOKING_ENGINE
+  TRAVEL_AGENT
+  OTA
+  CORPORATE
+  OTHER
+}
+
+enum CancellationReason {
+  CHANGED_MIND
+  NO_SHOW
+  FOUND_ALTERNATIVE
+  DUPLICATE_BOOKING
+  HOTEL_CANCELLED
+  OTHER
+}
+
+model Reservation {
+  id                 String              @id @default(cuid())
+  tenantId           String
+  reservationNo      String
+  customerId         String
+  roomId             String
+  source             ReservationSource   @default(WALK_IN)
+  bookingDate        DateTime            @default(now())
+  checkIn            DateTime
+  checkOut           DateTime
+  adults             Int                 @default(1)
+  children           Int                 @default(0)
+  mealPlan           MealPlan            @default(ROOM_ONLY)
+  status             ReservationStatus   @default(PENDING)
+  cancellationReason CancellationReason?
+  cancellationNotes  String?
+  notes              String?
+  createdBy          String?
+  updatedBy          String?
+  locationId         String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  tenant             Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer           Customer            @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  room               Room                @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  createdByEmployee  Employee?           @relation("ReservationCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedByEmployee  Employee?           @relation("ReservationUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+  location           Location?           @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  posOrders          PosOrder[]
+  folio              Folio?
+  additionalGuests   ReservationGuest[]
+  activities         ReservationActivity[]
+
+  @@unique([tenantId, reservationNo])
   @@index([tenantId, checkIn, checkOut])
   @@index([tenantId, roomId, status])
+}
+
+model ReservationGuest {
+  id            String      @id @default(cuid())
+  tenantId      String
+  reservationId String
+  name          String
+  idNumber      String?
+  notes         String?
+  addedAt       DateTime    @default(now())
+  addedBy       String?
+  tenant        Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservation   Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  addedByEmployee Employee? @relation(fields: [addedBy], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, reservationId])
+}
+
+enum ReservationActivityAction {
+  CREATED
+  UPDATED
+  CHECKED_IN
+  EXTENDED
+  GUEST_ADDED
+  GUEST_REMOVED
+  CHARGE_ADDED
+  CHARGE_REMOVED
+  DEPOSIT_RECORDED
+  CANCELLED
+  NO_SHOW
+  CHECKED_OUT
+}
+
+// Append-only timeline of who did what to a reservation, and where — a
+// generic updatedBy column can't answer "who checked this guest in" once a
+// later action (extend, cancel) overwrites it, so each meaningful action
+// gets its own permanent row instead of sharing one mutable field.
+model ReservationActivity {
+  id            String                    @id @default(cuid())
+  tenantId      String
+  tenant        Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservationId String
+  reservation   Reservation               @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  action        ReservationActivityAction
+  summary       String
+  performedBy   String?
+  employee      Employee?                 @relation(fields: [performedBy], references: [id], onDelete: SetNull)
+  locationId    String?
+  location      Location?                 @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  occurredAt    DateTime                  @default(now())
+
+  @@index([tenantId, reservationId, occurredAt])
+}
+
+enum FolioStatus {
+  OPEN
+  SETTLED
+}
+
+model Folio {
+  id            String          @id @default(cuid())
+  tenantId      String
+  folioNo       String
+  reservationId String          @unique
+  status        FolioStatus     @default(OPEN)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  tenant        Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservation   Reservation     @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  lineItems     FolioLineItem[]
+  payments      FolioPayment[]
+
+  @@unique([tenantId, folioNo])
+}
+
+enum FolioLineSource {
+  ROOM
+  SERVICE
+  POS_ORDER
+  AD_HOC
+}
+
+model FolioLineItem {
+  id          String          @id @default(cuid())
+  tenantId    String
+  folioId     String
+  source      FolioLineSource
+  label       String
+  amount      Decimal         @db.Decimal(12, 2)
+  quantity    Int             @default(1)
+  sourceRefId String?
+  createdAt   DateTime        @default(now())
+  createdBy   String?
+  tenant      Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  folio       Folio           @relation(fields: [folioId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, folioId])
+}
+
+enum FolioPaymentKind {
+  DEPOSIT
+  SETTLEMENT
+}
+
+model FolioPayment {
+  id              String           @id @default(cuid())
+  tenantId        String
+  folioId         String
+  kind            FolioPaymentKind
+  paymentMethodId String
+  amount          Decimal          @db.Decimal(12, 2)
+  reference       String?
+  createdAt       DateTime         @default(now())
+  createdBy       String?
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  folio           Folio            @relation(fields: [folioId], references: [id], onDelete: Cascade)
+  paymentMethod   PaymentMethod    @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, folioId])
+  @@index([tenantId, paymentMethodId])
+}
+
+// Tenant-configurable ways a customer can pay — replaces the old hardcoded
+// PaymentMethod enum for every place a customer actually pays the business
+// (folio deposits/checkout, POS bill settlement). System rows are seeded per
+// tenant to match that former enum 1:1 so existing data keeps working, but
+// can still be edited/disabled; only deletion is blocked on them.
+model PaymentMethod {
+  id                String         @id @default(cuid())
+  tenantId          String
+  tenant            Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name              String
+  code              String
+  description       String?
+  isSystem          Boolean        @default(false)
+  isActive          Boolean        @default(true)
+  requiresReference Boolean        @default(false)
+  sortOrder         Int            @default(0)
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  folioPayments     FolioPayment[]
+  posPayments       Payment[]
+  transactions      Transaction[]
+  expenses          Expense[]
+  assetMovements    AssetMovement[]
+
+  @@unique([tenantId, code])
+  @@unique([tenantId, name])
+}
+
+enum TransactionDirection {
+  IN
+  OUT
+}
+
+enum TransactionStatus {
+  COMPLETE
+  VOIDED
+}
+
+enum TransactionSource {
+  FOLIO_DEPOSIT
+  FOLIO_SETTLEMENT
+  POS_SALE
+  EXPENSE
+  ASSET_PURCHASE
+}
+
+// A single, unified ledger of every payment actually made across the
+// business, regardless of which module recorded it — the folio (deposits,
+// checkout settlements) and POS (bill settlements) both write here as a
+// side effect of the underlying payment, never directly.
+model Transaction {
+  id              String               @id @default(cuid())
+  tenantId        String
+  tenant          Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  transactionNo   String
+  direction       TransactionDirection
+  source          TransactionSource
+  status          TransactionStatus    @default(COMPLETE)
+  amount          Decimal              @db.Decimal(12, 2)
+  paymentMethodId String?
+  paymentMethod   PaymentMethod?       @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  reference       String?
+  customerId      String?
+  customer        Customer?            @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  locationId      String?
+  location        Location?            @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  employeeId      String?
+  employee        Employee?            @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  description     String?
+  sourceRefId     String?
+  createdAt       DateTime             @default(now())
+
+  @@unique([tenantId, transactionNo])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, paymentMethodId])
+}
+
+// Deliberately flat, no hierarchy — same shape as ServiceCategory — since
+// expense categories can't be predicted upfront and need full CRUD.
+model ExpenseCategory {
+  id          String    @id @default(cuid())
+  tenantId    String
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  expenses    Expense[]
+
+  @@unique([tenantId, name])
+}
+
+enum ExpenseStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+// Day-to-day incidental spending (tape, fare, a replacement part) recorded
+// by staff — never hard-deleted, only archived, matching the append-only
+// discipline already used for Reservation/Folio records. Each one also
+// writes an OUT-direction Transaction so it shows up in the same ledger as
+// money coming in.
+model Expense {
+  id                String          @id @default(cuid())
+  tenantId          String
+  tenant            Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  expenseNo         String
+  categoryId        String
+  category          ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  expenseDate       DateTime        @default(now())
+  amount            Decimal         @db.Decimal(12, 2)
+  paymentMethodId   String
+  paymentMethod     PaymentMethod   @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+  reference         String?
+  description       String?
+  locationId        String?
+  location          Location?       @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  status            ExpenseStatus   @default(ACTIVE)
+  createdBy         String?
+  createdByEmployee Employee?       @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@unique([tenantId, expenseNo])
+  @@index([tenantId, categoryId])
+  @@index([tenantId, expenseDate])
+}
+
+enum AssetMovementType {
+  RECEIPT
+  ADJUSTMENT
+  WRITE_OFF
+}
+
+// Durable, owned equipment (chairs, plates, cutlery) — distinct from Product
+// because it's never sold or consumed, just counted and occasionally
+// written off. One row per distinct item, not per physical unit; quantity
+// only ever changes through an AssetMovement, never a direct edit, mirroring
+// how Product's stock is never PATCHed directly either.
+model Asset {
+  id          String     @id @default(cuid())
+  tenantId    String
+  tenant      Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assetNo     String
+  categoryId  String?
+  category    Category?  @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  name        String
+  description String?
+  unit        String     @default("Each")
+  quantity    Decimal    @default(0) @db.Decimal(12, 3)
+  unitCost    Decimal?   @db.Decimal(12, 2)
+  locationId  String?
+  location    Location?  @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  isActive    Boolean    @default(true)
+  notes       String?
+  createdBy   String?
+  createdByEmployee Employee? @relation("AssetCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedBy   String?
+  updatedByEmployee Employee? @relation("AssetUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  movements   AssetMovement[]
+
+  @@unique([tenantId, assetNo])
+  @@index([tenantId, categoryId])
+  @@index([tenantId, locationId])
+}
+
+// The financial/audit trail for an Asset — mirrors InventoryMovement's role
+// for Product. Only a RECEIPT with a real cost writes a paymentMethodId and
+// a matching ledger Transaction; ADJUSTMENT/WRITE_OFF just correct the count.
+model AssetMovement {
+  id              String            @id @default(cuid())
+  tenantId        String
+  tenant          Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assetId         String
+  asset           Asset             @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  type            AssetMovementType
+  quantity        Decimal           @db.Decimal(12, 3)
+  unitCost        Decimal?          @db.Decimal(12, 2)
+  paymentMethodId String?
+  paymentMethod   PaymentMethod?    @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  reference       String?
+  note            String?
+  performedBy     String?
+  employee        Employee?         @relation(fields: [performedBy], references: [id], onDelete: SetNull)
+  occurredAt      DateTime          @default(now())
+  createdAt       DateTime          @default(now())
+
+  @@index([tenantId, assetId, occurredAt])
 }
 
 model CafeSettings {
@@ -314,49 +946,35 @@ model CafeSettings {
   tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 }
 
-model Store {
-  id        String          @id @default(cuid())
-  tenantId  String
-  name      String
-  code      String
-  isActive  Boolean         @default(true)
-  createdAt DateTime        @default(now())
-  updatedAt DateTime        @updatedAt
-  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  products  Product[]
-  movements InventoryMovement[]
-
-  @@unique([tenantId, code])
-}
-
 // Up to 3 levels deep (parent -> child -> grandchild), enforced in the route
 // layer. Self-referential; onDelete: Cascade so removing a category also
 // removes its descendants (products under it are only SetNull, never deleted).
 model Category {
-  id          String     @id @default(cuid())
+  id          String        @id @default(cuid())
   tenantId    String
-  tenant      Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  scope       CategoryScope @default(STORE)
   name        String
   description String?
   parentId    String?
-  parent      Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
-  children    Category[] @relation("CategoryHierarchy")
-  level       Int        @default(1)
-  isActive    Boolean    @default(true)
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
+  parent      Category?     @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children    Category[]    @relation("CategoryHierarchy")
+  level       Int           @default(1)
+  isActive    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
   products    Product[]
+  menuItems   MenuItem[]
+  assets      Asset[]
 
-  @@unique([tenantId, parentId, name])
-  @@index([tenantId, parentId])
+  @@unique([tenantId, scope, parentId, name])
+  @@index([tenantId, scope, parentId])
 }
 
 model Product {
   id         String    @id @default(cuid())
   tenantId   String
   tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  storeId    String
-  store      Store     @relation(fields: [storeId], references: [id], onDelete: Restrict)
   categoryId String?
   category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
 
@@ -373,9 +991,9 @@ model Product {
   isPerishable  Boolean @default(false)
   shelfLifeDays Int?
 
-  // Stock — quantity is the live running balance; opening stock is recorded
-  // as this value at creation plus a matching RECEIPT movement for the audit trail.
-  quantity      Decimal  @default(0) @db.Decimal(12, 3)
+  // Stock lives per-location (see ProductStock) — a product carries no
+  // quantity of its own. reorderLevel/maxStockLevel stay tenant-wide
+  // defaults for now; nothing needs them to vary per location yet.
   reorderLevel  Decimal  @default(0) @db.Decimal(12, 3)
   maxStockLevel Decimal? @db.Decimal(12, 3)
 
@@ -383,25 +1001,50 @@ model Product {
   unitCost          Decimal? @db.Decimal(12, 2)
   preferredSupplier String?
 
+  // Null means this product is never sold directly (e.g. a recipe
+  // ingredient only) — the Products POS only lists products with one set.
+  sellingPrice Decimal? @db.Decimal(12, 2)
+
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  menuItems       MenuItem[]
-  movements       InventoryMovement[]
-  menuIngredients MenuItemIngredient[]
+  menuItems         MenuItem[]
+  movements         InventoryMovement[]
+  recipeIngredients RecipeIngredient[]
+  stocks            ProductStock[]
+  orderItems        PosOrderItem[]
 
   @@unique([tenantId, sku])
   @@unique([tenantId, barcode])
-  @@index([tenantId, storeId])
   @@index([tenantId, categoryId])
+}
+
+// One live running balance per (product, location) — a location "carries"
+// a product iff a row exists for that pair. Replaces the old hardcoded
+// storeQuantity/kitchenQuantity split so stock can live at any tenant-
+// created location (warehouse or selling point) instead of exactly two.
+model ProductStock {
+  id         String   @id @default(cuid())
+  tenantId   String
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  quantity   Decimal  @default(0) @db.Decimal(12, 3)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([tenantId, productId, locationId])
+  @@index([tenantId, locationId])
 }
 
 model InventoryMovement {
   id          String                @id @default(cuid())
   tenantId    String
   productId   String
-  storeId     String
+  locationId  String
   type        InventoryMovementType
   quantity    Decimal               @db.Decimal(12, 3)
   note        String?
@@ -410,91 +1053,220 @@ model InventoryMovement {
   createdAt   DateTime              @default(now())
   tenant      Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   product     Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
-  store       Store                 @relation(fields: [storeId], references: [id], onDelete: Restrict)
+  location    Location              @relation(fields: [locationId], references: [id], onDelete: Restrict)
 
   @@index([tenantId, productId, occurredAt])
-  @@index([tenantId, storeId, occurredAt])
+  @@index([tenantId, locationId, occurredAt])
 }
 
-model MenuCategory {
-  id        String     @id @default(cuid())
-  tenantId  String
-  name      String
-  sortOrder Int        @default(0)
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
-  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  items     MenuItem[]
+enum LocationType {
+  RECEPTION
+  RESTAURANT
+  CAFE
+  BAKERY
+  BAR
+  GYM
+  SPA
+  STORE
+  SHOP
+  HOUSEKEEPING
+}
+
+// A physical selling point within the property — Restaurant, Bakery, Bar,
+// Gym, Spa, Reception, etc. A tenant that never creates one behaves exactly
+// as a single-location property (menu items are unfiltered, staff can sell
+// anywhere) — this whole feature is opt-in and backward compatible. Only
+// name is required; everything else here just makes a location easier to
+// identify and reach, not something the POS logic depends on.
+model Location {
+  id              String       @id @default(cuid())
+  tenantId        String
+  tenant          Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name            String
+  type            LocationType
+  description     String?
+  address         String?
+  managerId       String?
+  manager         Employee?    @relation("LocationManager", fields: [managerId], references: [id], onDelete: SetNull)
+  primaryPhone    String?
+  secondaryPhone  String?
+  email           String?
+  // Stored as "HH:MM" (24h) — a daily recurring time, not a specific date.
+  openingTime     String?
+  closingTime     String?
+  isActive        Boolean      @default(true)
+  // Selling permissions — which sale categories this location's POS shows.
+  // Default true across the board so every existing location keeps behaving
+  // exactly as it does today until someone deliberately unchecks one.
+  canSellRooms    Boolean      @default(true)
+  canSellMenu     Boolean      @default(true)
+  canSellServices Boolean      @default(true)
+  canSellProducts Boolean      @default(true)
+  // When true, a FOOD-channel order at this location skips the Kitchen
+  // ticket (OPEN/PREPARING/READY) entirely and is served the instant it's
+  // rung up — for a bar or bakery counter where staff hand the item over on
+  // the spot, not a kitchen that needs prep time tracked.
+  servesDirectly  Boolean      @default(false)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  menuItems       MenuItem[]
+  employees       Employee[]   @relation("LocationStaff")
+  orders          PosOrder[]
+  transactions    Transaction[]
+  expenses        Expense[]
+  productStocks      ProductStock[]
+  inventoryMovements InventoryMovement[]
+  services           Service[]
+  reservations          Reservation[]
+  customers             Customer[]
+  reservationActivities ReservationActivity[]
+  assets                Asset[]
+  tables                Table[]
 
   @@unique([tenantId, name])
 }
 
 model MenuItem {
-  id              String           @id @default(cuid())
-  tenantId        String
-  categoryId      String
-  productId       String?
-  name            String
-  description     String?
-  price           Decimal          @db.Decimal(12, 2)
-  temperature     DrinkTemperature @default(OTHER)
-  isAvailable     Boolean          @default(true)
-  createdAt       DateTime         @default(now())
-  updatedAt       DateTime         @updatedAt
-  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  category        MenuCategory     @relation(fields: [categoryId], references: [id], onDelete: Restrict)
-  product         Product?         @relation(fields: [productId], references: [id], onDelete: SetNull)
-  ingredients     MenuItemIngredient[]
-  orderItems      PosOrderItem[]
+  id           String           @id @default(cuid())
+  tenantId     String
+  categoryId   String
+  productId    String?
+  recipeId     String?
+  name         String
+  description  String?
+  photoUrl     String?
+  price        Decimal          @db.Decimal(12, 2)
+  temperature  DrinkTemperature @default(OTHER)
+  isVegetarian Boolean          @default(false)
+  isAvailable  Boolean          @default(true)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category     Category         @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  product      Product?         @relation(fields: [productId], references: [id], onDelete: SetNull)
+  recipe       Recipe?          @relation(fields: [recipeId], references: [id], onDelete: SetNull)
+  orderItems   PosOrderItem[]
+  addons       Addon[]
+  // Empty = unallocated = sellable at every location (the default).
+  locations    Location[]
 
   @@index([tenantId, categoryId])
+  @@index([tenantId, recipeId])
 }
 
 model PosOrder {
-  id          String         @id @default(cuid())
-  tenantId    String
+  id            String         @id @default(cuid())
+  tenantId      String
   reservationId String?
-  orderNumber Int
-  tableLabel  String?
-  status      PosOrderStatus @default(OPEN)
-  notes       String?
-  readyAt     DateTime?
-  servedAt    DateTime?
-  createdAt   DateTime       @default(now())
-  updatedAt   DateTime       @updatedAt
-  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  reservation Reservation?   @relation(fields: [reservationId], references: [id], onDelete: SetNull)
-  items       PosOrderItem[]
+  // Who this order is actually for — independent of tableId (which is just
+  // informational: how many people are at that table) and independent of
+  // whether/how it eventually gets paid. Set at creation when known, or
+  // derived from the reservation's own guest if billed to a room at
+  // settlement time.
+  customerId    String?
+  tableId       String?
+  locationId    String?
+  orderNumber   Int
+  status        PosOrderStatus  @default(OPEN)
+  channel       PosOrderChannel @default(FOOD)
+  discount      Decimal        @default(0) @db.Decimal(12, 2)
+  notes         String?
+  readyAt       DateTime?
+  servedAt      DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservation   Reservation?   @relation(fields: [reservationId], references: [id], onDelete: SetNull)
+  customer      Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  table         Table?         @relation(fields: [tableId], references: [id], onDelete: SetNull)
+  location      Location?      @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  items         PosOrderItem[]
+  payments      Payment[]
 
   @@unique([tenantId, orderNumber])
   @@index([tenantId, status, createdAt])
   @@index([reservationId])
+  @@index([tableId])
+  @@index([locationId])
 }
 
+// A physical seating spot in the restaurant/bar. One active (non-final)
+// order per table at a time — the table frees back to AVAILABLE once that
+// order is fully paid or cancelled.
+model Table {
+  id         String      @id @default(cuid())
+  tenantId   String
+  tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  label      String
+  area       String?
+  capacity   Int         @default(2)
+  status     TableStatus @default(AVAILABLE)
+  isActive   Boolean     @default(true)
+  // Which selling point this physical table belongs to — null means shared/
+  // unallocated (visible everywhere), the same convention as MenuItem/Service
+  // locations. Lets a Bar's table picker show only its own tables instead of
+  // every table tenant-wide.
+  locationId String?
+  location   Location?   @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  orders     PosOrder[]
+
+  @@unique([tenantId, label])
+  @@index([tenantId, locationId])
+}
+
+// A single settlement against an order. Multiple payments per order support
+// split bills (e.g. part cash, part M-Pesa).
+model Payment {
+  id              String        @id @default(cuid())
+  tenantId        String
+  orderId         String
+  paymentMethodId String
+  amount          Decimal       @db.Decimal(12, 2)
+  reference       String?
+  receivedBy      String?
+  createdAt       DateTime      @default(now())
+  tenant          Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  order           PosOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  paymentMethod   PaymentMethod @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, orderId])
+  @@index([tenantId, paymentMethodId])
+}
+
+// One of menuItemId/productId/serviceId is set, matching the parent order's
+// channel (enforced at the API layer, same convention as FolioLineItem.source
+// — no DB-level CHECK constraint for it either).
 model PosOrderItem {
-  id         String   @id @default(cuid())
+  id         String              @id @default(cuid())
   orderId    String
-  menuItemId String
-  quantity   Int      @default(1)
-  unitPrice  Decimal  @db.Decimal(12, 2)
-  createdAt  DateTime @default(now())
-  order      PosOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+  menuItemId String?
+  productId  String?
+  serviceId  String?
+  quantity   Int                 @default(1)
+  unitPrice  Decimal             @db.Decimal(12, 2)
+  createdAt  DateTime            @default(now())
+  order      PosOrder            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem   MenuItem?           @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+  product    Product?            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  service    Service?            @relation(fields: [serviceId], references: [id], onDelete: Restrict)
   addons     PosOrderItemAddon[]
 
   @@index([orderId])
 }
 
 model Addon {
-  id        String   @id @default(cuid())
-  tenantId  String
-  name      String
-  price     Decimal  @db.Decimal(12, 2)
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  id         String              @id @default(cuid())
+  tenantId   String
+  name       String
+  price      Decimal             @db.Decimal(12, 2)
+  isActive   Boolean             @default(true)
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+  tenant     Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   orderItems PosOrderItemAddon[]
+  menuItems  MenuItem[]
 
   @@unique([tenantId, name])
 }
@@ -512,17 +1284,39 @@ model PosOrderItemAddon {
   @@index([orderItemId])
 }
 
-model MenuItemIngredient {
-  id         String   @id @default(cuid())
-  menuItemId String
-  productId  String
-  quantity   Decimal  @db.Decimal(12, 3)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-  menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
-  product    Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+// A recipe is how a chef makes a dish: ordered prep steps, an estimated
+// prep time, and how much of each product it consumes. It's created
+// standalone in the Kitchen section, then optionally attached to one or
+// more MenuItems (e.g. a "small" and "large" size sharing one recipe).
+model Recipe {
+  id               String             @id @default(cuid())
+  tenantId         String
+  tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name             String
+  description      String?
+  steps            String[]           @default([])
+  estimatedMinutes Int?
+  isActive         Boolean            @default(true)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  ingredients      RecipeIngredient[]
+  menuItems        MenuItem[]
 
-  @@unique([menuItemId, productId])
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+model RecipeIngredient {
+  id        String   @id @default(cuid())
+  recipeId  String
+  productId String
+  quantity  Decimal  @db.Decimal(12, 3)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  recipe    Recipe   @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([recipeId, productId])
   @@index([productId])
 }
 
@@ -576,9 +1370,9 @@ model Session {
 }
 
 model Employee {
-  id          String    @id @default(cuid())
-  tenantId    String
-  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   // Personal info
   firstName   String
@@ -595,22 +1389,48 @@ model Employee {
   address          String?
 
   // Employment
-  department     EmployeeDepartment
-  jobTitle       String
-  employmentType EmploymentType @default(FULL_TIME)
-  status         EmployeeStatus @default(ACTIVE)
-  dateHired      DateTime
-  supervisorId   String?
-  supervisor     Employee?  @relation("EmployeeSupervisor", fields: [supervisorId], references: [id], onDelete: SetNull)
-  reports        Employee[] @relation("EmployeeSupervisor")
-  roleId         String?
-  role           Role?      @relation(fields: [roleId], references: [id], onDelete: SetNull)
-  sessions       Session[]
+  department          EmployeeDepartment
+  jobTitle            String
+  employmentType      EmploymentType     @default(FULL_TIME)
+  status              EmployeeStatus     @default(ACTIVE)
+  dateHired           DateTime
+  supervisorId        String?
+  supervisor          Employee?          @relation("EmployeeSupervisor", fields: [supervisorId], references: [id], onDelete: SetNull)
+  reports             Employee[]         @relation("EmployeeSupervisor")
+  roleId              String?
+  role                Role?              @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  // Fixed selling location — null means this employee can sell at any
+  // location (the POS will ask them to pick one for each sale).
+  locationId          String?
+  location            Location?          @relation("LocationStaff", fields: [locationId], references: [id], onDelete: SetNull)
+  managedLocations    Location[]         @relation("LocationManager")
+  sessions            Session[]
+  createdReservations Reservation[] @relation("ReservationCreatedBy")
+  updatedReservations Reservation[] @relation("ReservationUpdatedBy")
+  reservationActivities ReservationActivity[]
+  addedReservationGuests ReservationGuest[]
+  transactions        Transaction[]
+  expenses            Expense[]
+  foundLostItems      LostFoundItem[] @relation("LostFoundFoundBy")
+  collectedLostItems  LostFoundItem[] @relation("LostFoundCollectedBy")
+  createdCustomers    Customer[] @relation("CustomerCreatedBy")
+  updatedCustomers    Customer[] @relation("CustomerUpdatedBy")
+  createdRooms        Room[] @relation("RoomCreatedBy")
+  updatedRooms        Room[] @relation("RoomUpdatedBy")
+  createdRoomTypes    RoomType[] @relation("RoomTypeCreatedBy")
+  updatedRoomTypes    RoomType[] @relation("RoomTypeUpdatedBy")
+  createdRoomRates    RoomRate[] @relation("RoomRateCreatedBy")
+  updatedRoomRates    RoomRate[] @relation("RoomRateUpdatedBy")
+  createdHousekeepingTasks HousekeepingTask[] @relation("HousekeepingTaskCreatedBy")
+  updatedHousekeepingTasks HousekeepingTask[] @relation("HousekeepingTaskUpdatedBy")
+  createdAssets       Asset[] @relation("AssetCreatedBy")
+  updatedAssets       Asset[] @relation("AssetUpdatedBy")
+  assetMovements      AssetMovement[]
 
   // Compensation
   salaryType        SalaryType    @default(MONTHLY)
   salaryAmount      Decimal       @db.Decimal(12, 2)
-  paymentMethod     PaymentMethod @default(BANK_TRANSFER)
+  paymentMethod     EmployeePaymentMethod @default(BANK_TRANSFER)
   bankName          String?
   bankAccountNumber String?
   mpesaNumber       String?
@@ -658,7 +1478,12 @@ model BusinessProfile {
   tenantId String @unique
   tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  logoUrl  String?
+  logoUrl   String?
+  shortName String?
+
+  themeBaseColor   String @default("#1c74d1")
+  themeAccentColor String @default("#43a047")
+  themeFont        String @default("jost")
 
   businessName       String
   businessType       BusinessType

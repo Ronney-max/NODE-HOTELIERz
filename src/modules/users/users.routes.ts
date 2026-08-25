@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { requireModule } from "../../middleware/tenantContext.js";
+import { partialNoDefaults } from "../../lib/zod.js";
 
 // Authentication/actor roles are not implemented yet; this tenant-scoped CRUD
 // defines the users and roles that the future auth layer will enforce.
@@ -11,7 +12,7 @@ export const usersRouter = Router();
 usersRouter.use(requireModule("POS"));
 const roles = ["SUPER_ADMIN", "OWNER", "MANAGER", "STAFF", "BARISTA", "STORE_KEEPER", "RECEPTIONIST", "HOUSEKEEPER"] as const;
 const createSchema = z.object({ email: z.email().transform((value) => value.trim().toLowerCase()), password: z.string().min(8).max(128), firstName: z.string().trim().min(1).max(60), lastName: z.string().trim().min(1).max(60), role: z.enum(roles).default("STAFF"), isActive: z.boolean().default(true) });
-const updateSchema = createSchema.partial().omit({ password: true }).extend({ password: z.string().min(8).optional() });
+const updateSchema = partialNoDefaults(createSchema).omit({ password: true }).extend({ password: z.string().min(8).optional() });
 const listSchema = z.object({ search: z.string().trim().max(100).optional(), role: z.enum(roles).optional(), active: z.enum(["true", "false"]).optional() });
 const tenantId = (req: { tenantId?: string }) => { if (!req.tenantId) throw new Error("Tenant context is required"); return req.tenantId; };
 const publicFields = { id: true, email: true, firstName: true, lastName: true, role: true, isActive: true, createdAt: true, updatedAt: true } as const;

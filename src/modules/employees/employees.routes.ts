@@ -4,6 +4,7 @@ import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { hashSecret } from "../../lib/hash.js";
 import { requireModule } from "../../middleware/tenantContext.js";
+import { partialNoDefaults } from "../../lib/zod.js";
 
 export const employeesRouter = Router();
 employeesRouter.use(requireModule("HR"));
@@ -41,6 +42,7 @@ const createSchema = z.object({
   dateHired: z.coerce.date(),
   supervisorId: optionalId,
   roleId: optionalId,
+  locationId: optionalId,
   salaryType: z.enum(salaryTypes).default("MONTHLY"),
   salaryAmount: z.coerce.number().min(0),
   paymentMethod: z.enum(paymentMethods).default("BANK_TRANSFER"),
@@ -55,7 +57,7 @@ const createSchema = z.object({
   emergencyContactName: optionalText(80),
   emergencyContactPhone: optionalText(30),
 });
-const updateSchema = createSchema.partial().omit({ pin: true }).extend({ pin: z.string().trim().min(4).max(8).optional() });
+const updateSchema = partialNoDefaults(createSchema).omit({ pin: true }).extend({ pin: z.string().trim().min(4).max(8).optional() });
 const listSchema = z.object({
   search: z.string().trim().max(100).optional(),
   department: z.enum(departments).optional(),
@@ -88,6 +90,8 @@ const publicFields = {
   supervisor: { select: { id: true, firstName: true, lastName: true } },
   roleId: true,
   role: { select: { id: true, name: true, allowedSections: true } },
+  locationId: true,
+  location: { select: { id: true, name: true } },
   salaryType: true,
   salaryAmount: true,
   paymentMethod: true,
@@ -115,6 +119,12 @@ async function assertRoleInTenant(roleId: string | undefined, tenant: string) {
   if (!roleId) return;
   const role = await prisma.role.findFirst({ where: { id: roleId, tenantId: tenant }, select: { id: true } });
   if (!role) throw Object.assign(new Error("Selected role was not found"), { status: 400 });
+}
+
+async function assertLocationInTenant(locationId: string | undefined, tenant: string) {
+  if (!locationId) return;
+  const location = await prisma.location.findFirst({ where: { id: locationId, tenantId: tenant }, select: { id: true } });
+  if (!location) throw Object.assign(new Error("Selected location was not found"), { status: 400 });
 }
 
 employeesRouter.get("/", async (req, res) => {
@@ -153,12 +163,13 @@ employeesRouter.get("/:id", async (req, res) => {
 employeesRouter.post("/", async (req, res, next) => {
   const data = createSchema.safeParse(req.body);
   if (!data.success) { res.status(400).json({ error: "Invalid employee", details: data.error.flatten() }); return; }
-  const { pin, supervisorId, roleId, ...employeeData } = data.data;
+  const { pin, supervisorId, roleId, locationId, ...employeeData } = data.data;
   try {
     await assertSupervisorInTenant(supervisorId, tenantId(req));
     await assertRoleInTenant(roleId, tenantId(req));
+    await assertLocationInTenant(locationId, tenantId(req));
     const employee = await prisma.employee.create({
-      data: { tenantId: tenantId(req), ...employeeData, supervisorId: supervisorId ?? null, roleId: roleId ?? null, pin: hashSecret(pin) },
+      data: { tenantId: tenantId(req), ...employeeData, supervisorId: supervisorId ?? null, roleId: roleId ?? null, locationId: locationId ?? null, pin: hashSecret(pin) },
       select: publicFields,
     });
     res.status(201).json({ employee });
@@ -172,13 +183,14 @@ employeesRouter.post("/", async (req, res, next) => {
 employeesRouter.patch("/:id", async (req, res, next) => {
   const data = updateSchema.safeParse(req.body);
   if (!data.success) { res.status(400).json({ error: "Invalid employee", details: data.error.flatten() }); return; }
-  const { pin, supervisorId, roleId, ...employeeData } = data.data;
+  const { pin, supervisorId, roleId, locationId, ...employeeData } = data.data;
   try {
     if (supervisorId !== undefined) await assertSupervisorInTenant(supervisorId, tenantId(req), req.params.id);
     if (roleId !== undefined) await assertRoleInTenant(roleId, tenantId(req));
+    if (locationId !== undefined) await assertLocationInTenant(locationId, tenantId(req));
     const updated = await prisma.employee.updateMany({
       where: { id: req.params.id, tenantId: tenantId(req) },
-      data: { ...employeeData, ...(supervisorId !== undefined ? { supervisorId: supervisorId ?? null } : {}), ...(roleId !== undefined ? { roleId: roleId ?? null } : {}), ...(pin ? { pin: hashSecret(pin) } : {}) },
+      data: { ...employeeData, ...(supervisorId !== undefined ? { supervisorId: supervisorId ?? null } : {}), ...(roleId !== undefined ? { roleId: roleId ?? null } : {}), ...(locationId !== undefined ? { locationId: locationId ?? null } : {}), ...(pin ? { pin: hashSecret(pin) } : {}) },
     });
     if (!updated.count) { res.status(404).json({ error: "Employee not found" }); return; }
     res.json({ employee: await prisma.employee.findUniqueOrThrow({ where: { id: req.params.id }, select: publicFields }) });

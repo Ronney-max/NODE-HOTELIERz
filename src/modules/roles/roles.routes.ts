@@ -2,6 +2,7 @@ import { Router } from "express";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
+import { partialNoDefaults } from "../../lib/zod.js";
 
 export const rolesRouter = Router();
 
@@ -14,7 +15,7 @@ const createSchema = z.object({
   description: z.preprocess(blankToUndefined, z.string().trim().max(200).optional()),
   allowedSections: z.array(z.enum(sections)).default([]),
 });
-const updateSchema = createSchema.partial();
+const updateSchema = partialNoDefaults(createSchema);
 
 const tenantId = (req: { tenantId?: string }) => {
   if (!req.tenantId) throw new Error("Tenant context is required");

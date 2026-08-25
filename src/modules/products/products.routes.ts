@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { requireModule } from "../../middleware/tenantContext.js";
+import { partialNoDefaults } from "../../lib/zod.js";
 
 export const productsRouter = Router();
 productsRouter.use(requireModule("PRODUCTS"));
@@ -20,7 +21,6 @@ const optionalId = z.preprocess(blankToUndefined, z.string().trim().optional());
 const optionalNumber = (min = 0) => z.preprocess(blankToUndefined, z.coerce.number().min(min).optional());
 
 const createSchema = z.object({
-  storeId: z.string().trim().min(1),
   categoryId: optionalId,
   name: z.string().trim().min(1).max(150),
   sku: optionalText(60),
@@ -31,17 +31,25 @@ const createSchema = z.object({
   unit: z.enum(UNITS_OF_MEASURE).default("Each"),
   isPerishable: z.boolean().default(false),
   shelfLifeDays: optionalNumber(0),
-  quantity: z.coerce.number().min(0).default(0),
+  openingStock: z.coerce.number().min(0).default(0),
+  // Where opening stock is received. Optional when the property has exactly
+  // one location (auto-resolved, same convenience the old single-store
+  // system had) — required otherwise, and only when opening stock is > 0.
+  locationId: optionalId,
   reorderLevel: z.coerce.number().min(0).default(0),
   maxStockLevel: optionalNumber(0),
   unitCost: optionalNumber(0),
+  // Null/omitted means this product is never sold directly (e.g. a recipe
+  // ingredient only) — the Products POS only lists ones with a price set.
+  sellingPrice: optionalNumber(0),
   preferredSupplier: optionalText(120),
   isActive: z.boolean().default(true),
 });
-const updateSchema = createSchema.omit({ quantity: true }).partial();
+const updateSchema = partialNoDefaults(createSchema.omit({ openingStock: true, locationId: true }));
 
 const movementSchema = z.object({
   type: z.enum(["RECEIPT", "DISPATCH", "ADJUSTMENT"]),
+  locationId: z.string().trim().min(1),
   quantity: z.coerce.number().finite().refine((value) => value !== 0, "Quantity cannot be zero"),
   note: z.string().trim().max(500).optional(),
   occurredAt: z.coerce.date().optional(),
@@ -51,6 +59,14 @@ const movementSchema = z.object({
   }
 });
 
+const transferSchema = z.object({
+  fromLocationId: z.string().trim().min(1),
+  toLocationId: z.string().trim().min(1),
+  quantity: z.coerce.number().positive(),
+  note: z.string().trim().max(500).optional(),
+  occurredAt: z.coerce.date().optional(),
+}).refine((v) => v.fromLocationId !== v.toLocationId, { message: "Choose two different locations", path: ["toLocationId"] });
+
 const tenantId = (req: { tenantId?: string }) => {
   if (!req.tenantId) throw new Error("Tenant context is required");
   return req.tenantId;
@@ -58,8 +74,6 @@ const tenantId = (req: { tenantId?: string }) => {
 
 const productFields = {
   id: true,
-  storeId: true,
-  store: { select: { id: true, name: true, code: true } },
   categoryId: true,
   category: { select: { id: true, name: true, level: true } },
   name: true,
@@ -71,30 +85,48 @@ const productFields = {
   unit: true,
   isPerishable: true,
   shelfLifeDays: true,
-  quantity: true,
   reorderLevel: true,
   maxStockLevel: true,
   unitCost: true,
+  sellingPrice: true,
   preferredSupplier: true,
   isActive: true,
   createdAt: true,
   updatedAt: true,
+  stocks: { select: { locationId: true, quantity: true, location: { select: { id: true, name: true } } } },
 } as const;
+
+type ProductWithStocks = { stocks: { locationId: string; quantity: Prisma.Decimal; location: { id: string; name: string } }[] };
+
+const totalOf = (p: ProductWithStocks) => p.stocks.reduce((sum, s) => sum + Number(s.quantity), 0);
+
+const withTotal = <T extends ProductWithStocks>(p: T) => {
+  const { stocks, ...rest } = p;
+  return {
+    ...rest,
+    stockByLocation: stocks.map((s) => ({ locationId: s.locationId, locationName: s.location.name, quantity: Number(s.quantity).toFixed(3) })),
+    totalQuantity: totalOf(p).toFixed(3),
+  };
+};
+
+async function assertLocationInTenant(locationId: string, tid: string) {
+  const location = await prisma.location.findFirst({ where: { id: locationId, tenantId: tid }, select: { id: true, name: true } });
+  if (!location) throw Object.assign(new Error("Choose a location from this property"), { status: 400 });
+  return location;
+}
 
 productsRouter.get("/", async (req, res) => {
   const query = z.object({
     search: z.string().trim().max(100).optional(),
-    storeId: z.string().trim().optional(),
     categoryId: z.string().trim().optional(),
     lowStock: z.enum(["true", "false"]).optional(),
     active: z.enum(["true", "false"]).optional(),
   }).safeParse(req.query);
   if (!query.success) { res.status(400).json({ error: "Invalid product filters", details: query.error.flatten() }); return; }
-  const { search, storeId, categoryId, lowStock, active } = query.data;
+  const { search, categoryId, lowStock, active } = query.data;
   const tid = tenantId(req);
   const where: Prisma.ProductWhereInput = {
     tenantId: tid,
-    ...(storeId ? { storeId } : {}),
     ...(categoryId ? { categoryId } : {}),
     ...(active ? { isActive: active === "true" } : {}),
     ...(search ? { OR: [
@@ -105,12 +137,13 @@ productsRouter.get("/", async (req, res) => {
     ] } : {}),
   };
   const products = await prisma.product.findMany({ where, select: productFields, orderBy: { name: "asc" } });
-  const visible = lowStock === "true" ? products.filter((p) => Number(p.quantity) <= Number(p.reorderLevel)) : products;
+  const withTotals = products.map(withTotal);
+  const visible = lowStock === "true" ? withTotals.filter((p) => Number(p.totalQuantity) <= Number(p.reorderLevel)) : withTotals;
   const [total, active_, lowStockCount] = await Promise.all([
     prisma.product.count({ where: { tenantId: tid } }),
     prisma.product.count({ where: { tenantId: tid, isActive: true } }),
-    prisma.product.findMany({ where: { tenantId: tid }, select: { quantity: true, reorderLevel: true } })
-      .then((all) => all.filter((p) => Number(p.quantity) <= Number(p.reorderLevel)).length),
+    prisma.product.findMany({ where: { tenantId: tid }, select: { reorderLevel: true, stocks: { select: { quantity: true } } } })
+      .then((all) => all.filter((p) => p.stocks.reduce((s, x) => s + Number(x.quantity), 0) <= Number(p.reorderLevel)).length),
   ]);
   res.json({ products: visible, summary: { total, active: active_, inactive: total - active_, lowStock: lowStockCount } });
 });
@@ -118,33 +151,40 @@ productsRouter.get("/", async (req, res) => {
 productsRouter.get("/:id", async (req, res) => {
   const product = await prisma.product.findFirst({ where: { id: req.params.id, tenantId: tenantId(req) }, select: productFields });
   if (!product) { res.status(404).json({ error: "Product not found" }); return; }
-  res.json({ product });
+  res.json({ product: withTotal(product) });
 });
 
 productsRouter.post("/", async (req, res, next) => {
   const data = createSchema.safeParse(req.body);
   if (!data.success) { res.status(400).json({ error: "Invalid product", details: data.error.flatten() }); return; }
   const tid = tenantId(req);
-  const { quantity, categoryId, ...rest } = data.data;
+  const { openingStock, locationId, categoryId, ...rest } = data.data;
   try {
-    const store = await prisma.store.findFirst({ where: { id: data.data.storeId, tenantId: tid, isActive: true } });
-    if (!store) { res.status(400).json({ error: "Choose an active store from this property" }); return; }
+    let receivingLocationId = locationId;
+    if (openingStock > 0 && !receivingLocationId) {
+      const locations = await prisma.location.findMany({ where: { tenantId: tid }, select: { id: true } });
+      if (locations.length === 1) receivingLocationId = locations[0].id;
+      else { res.status(400).json({ error: "Choose a location to receive the opening stock at" }); return; }
+    }
+    if (receivingLocationId) await assertLocationInTenant(receivingLocationId, tid);
     if (categoryId) {
-      const category = await prisma.category.findFirst({ where: { id: categoryId, tenantId: tid } });
+      const category = await prisma.category.findFirst({ where: { id: categoryId, tenantId: tid, scope: "STORE" } });
       if (!category) { res.status(400).json({ error: "Selected category was not found" }); return; }
     }
     const product = await prisma.$transaction(async (tx) => {
-      const created = await tx.product.create({ data: { tenantId: tid, categoryId, quantity, ...rest }, select: productFields });
-      if (quantity > 0) {
+      const created = await tx.product.create({ data: { tenantId: tid, categoryId, ...rest } });
+      if (openingStock > 0 && receivingLocationId) {
+        await tx.productStock.create({ data: { tenantId: tid, productId: created.id, locationId: receivingLocationId, quantity: openingStock } });
         await tx.inventoryMovement.create({
-          data: { tenantId: tid, productId: created.id, storeId: created.storeId, type: "RECEIPT", quantity, note: "Opening stock", performedBy: req.userId },
+          data: { tenantId: tid, productId: created.id, locationId: receivingLocationId, type: "RECEIPT", quantity: openingStock, note: "Opening stock", performedBy: req.userId },
         });
       }
-      return created;
+      return tx.product.findUniqueOrThrow({ where: { id: created.id }, select: productFields });
     });
-    res.status(201).json({ product });
+    res.status(201).json({ product: withTotal(product) });
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") { res.status(409).json({ error: "A product with this SKU or barcode already exists" }); return; }
+    if (error instanceof Error && "status" in error) { res.status((error as Error & { status: number }).status).json({ error: error.message }); return; }
     next(error);
   }
 });
@@ -154,17 +194,14 @@ productsRouter.patch("/:id", async (req, res, next) => {
   if (!data.success) { res.status(400).json({ error: "Invalid product", details: data.error.flatten() }); return; }
   const tid = tenantId(req);
   try {
-    if (data.data.storeId) {
-      const store = await prisma.store.findFirst({ where: { id: data.data.storeId, tenantId: tid, isActive: true } });
-      if (!store) { res.status(400).json({ error: "Choose an active store from this property" }); return; }
-    }
     if (data.data.categoryId) {
       const category = await prisma.category.findFirst({ where: { id: data.data.categoryId, tenantId: tid } });
       if (!category) { res.status(400).json({ error: "Selected category was not found" }); return; }
     }
     const updated = await prisma.product.updateMany({ where: { id: req.params.id, tenantId: tid }, data: data.data });
     if (!updated.count) { res.status(404).json({ error: "Product not found" }); return; }
-    res.json({ product: await prisma.product.findUniqueOrThrow({ where: { id: req.params.id }, select: productFields }) });
+    const product = await prisma.product.findUniqueOrThrow({ where: { id: req.params.id }, select: productFields });
+    res.json({ product: withTotal(product) });
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") { res.status(409).json({ error: "A product with this SKU or barcode already exists" }); return; }
     next(error);
@@ -183,33 +220,141 @@ productsRouter.delete("/:id", async (req, res, next) => {
 });
 
 productsRouter.get("/:id/movements", async (req, res) => {
-  const product = await prisma.product.findFirst({ where: { id: req.params.id, tenantId: tenantId(req) } });
+  const product = await prisma.product.findFirst({ where: { id: req.params.id, tenantId: tenantId(req) }, select: productFields });
   if (!product) { res.status(404).json({ error: "Product not found" }); return; }
   const movements = await prisma.inventoryMovement.findMany({
-    where: { productId: product.id, tenantId: product.tenantId },
-    include: { store: { select: { id: true, name: true } } },
+    where: { productId: product.id, tenantId: tenantId(req) },
+    include: { location: { select: { id: true, name: true } } },
     orderBy: { occurredAt: "desc" },
   });
-  res.json({ product, movements });
+  res.json({ product: withTotal(product), movements });
 });
 
+/** Manual stock movement at a single location: receiving, dispatch (stock
+ * leaving the business — waste/spoilage/breakage), or a correction. To move
+ * stock between two locations, use /transfer. */
 productsRouter.post("/:id/movements", async (req, res) => {
   const data = movementSchema.safeParse(req.body);
   if (!data.success) { res.status(400).json({ error: "Invalid stock movement", details: data.error.flatten() }); return; }
   const tid = tenantId(req);
   const product = await prisma.product.findFirst({ where: { id: req.params.id, tenantId: tid } });
   if (!product) { res.status(404).json({ error: "Product not found" }); return; }
-  const signedQuantity = data.data.type === "DISPATCH" ? -data.data.quantity : data.data.quantity;
+  const location = await assertLocationInTenant(data.data.locationId, tid).catch(() => null);
+  if (!location) { res.status(400).json({ error: "Choose a location from this property" }); return; }
+  const { type, locationId, note, occurredAt } = data.data;
+  const signedQuantity = type === "DISPATCH" ? -data.data.quantity : data.data.quantity;
+
   const result = await prisma.$transaction(async (tx) => {
-    const updated = await tx.product.updateMany({
-      where: { id: product.id, quantity: { gte: signedQuantity < 0 ? Math.abs(signedQuantity) : 0 } },
-      data: { quantity: { increment: signedQuantity } },
-    });
-    if (!updated.count) return null;
+    if (signedQuantity < 0) {
+      const decremented = await tx.productStock.updateMany({
+        where: { tenantId: tid, productId: product.id, locationId, quantity: { gte: -signedQuantity } },
+        data: { quantity: { increment: signedQuantity } },
+      });
+      if (!decremented.count) return null;
+    } else {
+      await tx.productStock.upsert({
+        where: { tenantId_productId_locationId: { tenantId: tid, productId: product.id, locationId } },
+        create: { tenantId: tid, productId: product.id, locationId, quantity: signedQuantity },
+        update: { quantity: { increment: signedQuantity } },
+      });
+    }
     return tx.inventoryMovement.create({
-      data: { tenantId: tid, productId: product.id, storeId: product.storeId, type: data.data.type, quantity: signedQuantity, note: data.data.note, occurredAt: data.data.occurredAt, performedBy: req.userId },
+      data: { tenantId: tid, productId: product.id, locationId, type, quantity: signedQuantity, note, occurredAt, performedBy: req.userId },
+      include: { location: { select: { id: true, name: true } } },
     });
   });
-  if (!result) { res.status(400).json({ error: "Dispatch would take stock below zero" }); return; }
-  res.status(201).json({ movement: result, product: await prisma.product.findUniqueOrThrow({ where: { id: product.id }, select: productFields }) });
+  if (!result) { res.status(400).json({ error: `Not enough stock at ${location.name} for this` }); return; }
+  const updatedProduct = await prisma.product.findUniqueOrThrow({ where: { id: product.id }, select: productFields });
+  res.status(201).json({ movement: result, product: withTotal(updatedProduct) });
+});
+
+/** Moves stock between any two locations. Recorded as a matched pair of
+ * movements (one per location) so each location's audit trail fully
+ * explains its own balance. */
+productsRouter.post("/:id/transfer", async (req, res) => {
+  const data = transferSchema.safeParse(req.body);
+  if (!data.success) { res.status(400).json({ error: "Invalid transfer", details: data.error.flatten() }); return; }
+  const tid = tenantId(req);
+  const product = await prisma.product.findFirst({ where: { id: req.params.id, tenantId: tid } });
+  if (!product) { res.status(404).json({ error: "Product not found" }); return; }
+  const { fromLocationId, toLocationId, quantity, note, occurredAt } = data.data;
+  const [fromLocation, toLocation] = await Promise.all([
+    assertLocationInTenant(fromLocationId, tid).catch(() => null),
+    assertLocationInTenant(toLocationId, tid).catch(() => null),
+  ]);
+  if (!fromLocation || !toLocation) { res.status(400).json({ error: "Choose two locations from this property" }); return; }
+
+  const result = await prisma.$transaction(async (tx) => {
+    const debited = await tx.productStock.updateMany({
+      where: { tenantId: tid, productId: product.id, locationId: fromLocationId, quantity: { gte: quantity } },
+      data: { quantity: { decrement: quantity } },
+    });
+    if (!debited.count) return null;
+    await tx.productStock.upsert({
+      where: { tenantId_productId_locationId: { tenantId: tid, productId: product.id, locationId: toLocationId } },
+      create: { tenantId: tid, productId: product.id, locationId: toLocationId, quantity },
+      update: { quantity: { increment: quantity } },
+    });
+    const transferNote = note ?? `Transferred to ${toLocation.name}`;
+    const [debitMovement] = await Promise.all([
+      tx.inventoryMovement.create({ data: { tenantId: tid, productId: product.id, locationId: fromLocationId, type: "TRANSFER", quantity: -quantity, note: transferNote, occurredAt, performedBy: req.userId } }),
+      tx.inventoryMovement.create({ data: { tenantId: tid, productId: product.id, locationId: toLocationId, type: "TRANSFER", quantity, note: transferNote, occurredAt, performedBy: req.userId } }),
+    ]);
+    return debitMovement;
+  });
+  if (!result) { res.status(400).json({ error: `Not enough stock at ${fromLocation.name} to transfer` }); return; }
+  const updatedProduct = await prisma.product.findUniqueOrThrow({ where: { id: product.id }, select: productFields });
+  res.status(201).json({ product: withTotal(updatedProduct) });
+});
+
+const distributeSchema = z.object({
+  fromLocationId: z.string().trim().min(1),
+  toLocationId: z.string().trim().min(1),
+  items: z.array(z.object({ productId: z.string().trim().min(1), quantity: z.coerce.number().positive() })).min(1),
+  note: z.string().trim().max(500).optional(),
+}).refine((v) => v.fromLocationId !== v.toLocationId, { message: "Choose two different locations", path: ["toLocationId"] });
+
+/** Batch version of /:id/transfer — moves several products from one location
+ * to another in a single all-or-nothing transaction, for the "distribute
+ * stock from the warehouse to a selling point" workflow. */
+productsRouter.post("/distribute", async (req, res) => {
+  const data = distributeSchema.safeParse(req.body);
+  if (!data.success) { res.status(400).json({ error: "Invalid distribution", details: data.error.flatten() }); return; }
+  const tid = tenantId(req);
+  const { fromLocationId, toLocationId, items, note } = data.data;
+  const [fromLocation, toLocation] = await Promise.all([
+    assertLocationInTenant(fromLocationId, tid).catch(() => null),
+    assertLocationInTenant(toLocationId, tid).catch(() => null),
+  ]);
+  if (!fromLocation || !toLocation) { res.status(400).json({ error: "Choose two locations from this property" }); return; }
+  const productIds = items.map((item) => item.productId);
+  const products = await prisma.product.findMany({ where: { id: { in: productIds }, tenantId: tid }, select: { id: true, name: true } });
+  if (products.length !== new Set(productIds).size) { res.status(400).json({ error: "Every item must be a product from this property" }); return; }
+  const productNames = new Map(products.map((p) => [p.id, p.name]));
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      const transferNote = note ?? `Distributed to ${toLocation.name}`;
+      for (const item of items) {
+        const debited = await tx.productStock.updateMany({
+          where: { tenantId: tid, productId: item.productId, locationId: fromLocationId, quantity: { gte: item.quantity } },
+          data: { quantity: { decrement: item.quantity } },
+        });
+        if (!debited.count) throw Object.assign(new Error(`Not enough ${productNames.get(item.productId)} at ${fromLocation.name} to distribute`), { status: 400 });
+        await tx.productStock.upsert({
+          where: { tenantId_productId_locationId: { tenantId: tid, productId: item.productId, locationId: toLocationId } },
+          create: { tenantId: tid, productId: item.productId, locationId: toLocationId, quantity: item.quantity },
+          update: { quantity: { increment: item.quantity } },
+        });
+        await Promise.all([
+          tx.inventoryMovement.create({ data: { tenantId: tid, productId: item.productId, locationId: fromLocationId, type: "TRANSFER", quantity: -item.quantity, note: transferNote, performedBy: req.userId } }),
+          tx.inventoryMovement.create({ data: { tenantId: tid, productId: item.productId, locationId: toLocationId, type: "TRANSFER", quantity: item.quantity, note: transferNote, performedBy: req.userId } }),
+        ]);
+      }
+    });
+  } catch (error) {
+    if (error instanceof Error && "status" in error) { res.status((error as Error & { status: number }).status).json({ error: error.message }); return; }
+    throw error;
+  }
+  res.status(201).json({ ok: true });
 });

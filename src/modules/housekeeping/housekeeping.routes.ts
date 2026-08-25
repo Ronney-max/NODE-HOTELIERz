@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { prisma } from "../../lib/prisma.js";
 import { requireModule } from "../../middleware/tenantContext.js";
+import { partialNoDefaults } from "../../lib/zod.js";
 
 export const housekeepingRouter = Router();
 housekeepingRouter.use(requireModule("HOUSEKEEPING"));
@@ -14,12 +15,12 @@ const taskSchema = z.object({
   notes: z.string().trim().max(500).optional(),
   dueAt: z.coerce.date().optional(),
 });
-const taskUpdateSchema = taskSchema.partial().extend({ status: z.enum(["PENDING", "IN_PROGRESS", "COMPLETED"]).optional() });
+const taskUpdateSchema = partialNoDefaults(taskSchema).extend({ status: z.enum(["PENDING", "IN_PROGRESS", "COMPLETED"]).optional() });
 const taskListSchema = z.object({ status: z.enum(["PENDING", "IN_PROGRESS", "COMPLETED"]).optional(), type: z.enum(["CLEANING", "INSPECTION", "MAINTENANCE"]).optional(), roomId: z.string().cuid().optional() });
 function tenantId(req: { tenantId?: string }): string { if (!req.tenantId) throw new Error("Tenant context is required"); return req.tenantId; }
 
 housekeepingRouter.get("/rooms", async (req, res) => {
-  const rooms = await prisma.room.findMany({ where: { tenantId: tenantId(req) }, orderBy: [{ cleanliness: "desc" }, { number: "asc" }] });
+  const rooms = await prisma.room.findMany({ where: { tenantId: tenantId(req) }, include: { roomType: true }, orderBy: [{ cleanliness: "desc" }, { number: "asc" }] });
   res.json({ rooms, summary: { ready: rooms.filter((room) => room.status === "VACANT" && room.cleanliness === "CLEAN").length, needsService: rooms.filter((room) => room.cleanliness !== "CLEAN").length } });
 });
 
@@ -52,7 +53,7 @@ housekeepingRouter.post("/tasks", async (req, res) => {
   const duplicate = await prisma.housekeepingTask.findFirst({ where: { tenantId: scopeTenantId, roomId: room.id, type: parsed.data.type, status: { in: ["PENDING", "IN_PROGRESS"] } } });
   if (duplicate) { res.status(409).json({ error: `An active ${parsed.data.type.toLowerCase()} task already exists for room ${room.number}` }); return; }
   const task = await prisma.$transaction(async (tx) => {
-    const created = await tx.housekeepingTask.create({ data: { tenantId: scopeTenantId, ...parsed.data }, include: { room: true } });
+    const created = await tx.housekeepingTask.create({ data: { tenantId: scopeTenantId, createdBy: req.userId, ...parsed.data }, include: { room: true } });
     if (parsed.data.type === "CLEANING") await tx.room.update({ where: { id: room.id }, data: { cleanliness: "DIRTY" } });
     return created;
   });
@@ -69,7 +70,7 @@ housekeepingRouter.patch("/tasks/:id", async (req, res) => {
     if (!room) { res.status(400).json({ error: "Choose a room from this property" }); return; }
   }
   const task = await prisma.$transaction(async (tx) => {
-    const updated = await tx.housekeepingTask.update({ where: { id: existing.id }, data: { ...parsed.data, ...(parsed.data.status === "COMPLETED" ? { completedAt: new Date() } : parsed.data.status ? { completedAt: null } : {}) }, include: { room: true } });
+    const updated = await tx.housekeepingTask.update({ where: { id: existing.id }, data: { ...parsed.data, updatedBy: req.userId, ...(parsed.data.status === "COMPLETED" ? { completedAt: new Date() } : parsed.data.status ? { completedAt: null } : {}) }, include: { room: true } });
     if (parsed.data.status === "IN_PROGRESS") await tx.room.update({ where: { id: updated.roomId }, data: { cleanliness: "INSPECTING" } });
     if (parsed.data.status === "COMPLETED" && ["CLEANING", "INSPECTION"].includes(updated.type)) await tx.room.update({ where: { id: updated.roomId }, data: { cleanliness: "CLEAN" } });
     return updated;
