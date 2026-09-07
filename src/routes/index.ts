@@ -9,6 +9,7 @@ import { storeRouter } from "../modules/store/store.routes.js";
 import { productsRouter } from "../modules/products/products.routes.js";
 import { menuRouter } from "../modules/menu/menu.routes.js";
 import { usersRouter } from "../modules/users/users.routes.js";
+import { serviceCenterRouter } from "../modules/service-center/service-center.routes.js";
 
 export const router = Router();
 
@@ -25,3 +26,4 @@ router.use("/stores", storeRouter);
 router.use("/products", productsRouter);
 router.use("/menu", menuRouter);
 router.use("/users", usersRouter);
+router.use("/service-center", serviceCenterRouter);
