@@ -16,11 +16,21 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
+          # Abort (and fail the workflow) the moment any command below errors,
+          # instead of ploughing on and reporting a green "deploy" that did
+          # nothing.
+          script_stop: true
           script: |
+            set -e
             cd ~/NODE-HOTELIER
-            git pull origin main
-            npm install
+            # A deploy checkout owns no local edits worth keeping — force it
+            # to exactly match origin/main. `.env`, node_modules/, dist/ and
+            # uploads/ are gitignored, so they survive this.
+            git fetch origin main
+            git reset --hard origin/main
+            # `npm ci` installs from package-lock.json without rewriting it,
+            # so it can never drift and block the next `git` step.
+            npm ci
             npx prisma migrate deploy
-            npm run seed
             npm run build
-            pm2 restart hotelier-server
+            pm2 restart hotelier-server --update-env
