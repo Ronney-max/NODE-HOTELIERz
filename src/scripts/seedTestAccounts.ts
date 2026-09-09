@@ -89,9 +89,10 @@ const dateHired = new Date();
 for (const plan of plans) {
   const rid = roleId(plan.role);
   for (const person of plan.people) {
+    const locations = person.locationId ? { set: [{ id: person.locationId }] } : { set: [] };
     await prisma.employee.upsert({
       where: { tenantId_employeeCode: { tenantId: tenant.id, employeeCode: person.code } },
-      update: { roleId: rid, locationId: person.locationId ?? null, departmentId: deptId(plan.department), jobTitle: plan.jobTitle },
+      update: { roleId: rid, locations, departmentId: deptId(plan.department), jobTitle: plan.jobTitle },
       create: {
         tenantId: tenant.id,
         employeeCode: person.code,
@@ -104,7 +105,7 @@ for (const plan of plans) {
         dateHired,
         salaryAmount: 30000,
         roleId: rid,
-        locationId: person.locationId ?? null,
+        locations: person.locationId ? { connect: [{ id: person.locationId }] } : undefined,
         status: "ACTIVE",
       },
     });

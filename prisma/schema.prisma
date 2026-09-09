@@ -1593,10 +1593,10 @@ model Employee {
   reports             Employee[]         @relation("EmployeeSupervisor")
   roleId              String?
   role                Role?              @relation(fields: [roleId], references: [id], onDelete: SetNull)
-  // Fixed selling location — null means this employee can sell at any
-  // location (the POS will ask them to pick one for each sale).
-  locationId          String?
-  location            Location?          @relation("LocationStaff", fields: [locationId], references: [id], onDelete: SetNull)
+  // Selling/working locations this employee is pinned to. Empty = no
+  // restriction (can work at any location; the POS asks which each time);
+  // one or more restricts them to that set.
+  locations           Location[]         @relation("LocationStaff")
   managedLocations    Location[]         @relation("LocationManager")
   sessions            Session[]
   createdReservations Reservation[] @relation("ReservationCreatedBy")

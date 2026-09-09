@@ -5,6 +5,7 @@ import type { Prisma, ReservationActivityAction } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { requireModule } from "../../middleware/tenantContext.js";
 import { nextCustomerNo, nextReservationNo, nextFolioNo, nextTransactionNo } from "../../lib/sequence.js";
+import { resolveActorLocation } from "../../lib/location.js";
 import { partialNoDefaults } from "../../lib/zod.js";
 
 export const receptionRouter = Router();
@@ -90,9 +91,9 @@ type ActorContext = { locationId: string | null; performedBy: string | undefined
 // location is load-bearing for stock/sales logic.
 async function resolveActor(tid: string, req: { userId?: string }): Promise<ActorContext> {
   if (!req.userId) return { locationId: null, performedBy: undefined, name: "System" };
-  const employee = await prisma.employee.findFirst({ where: { id: req.userId, tenantId: tid }, select: { locationId: true, firstName: true, lastName: true } });
+  const employee = await prisma.employee.findFirst({ where: { id: req.userId, tenantId: tid }, select: { firstName: true, lastName: true } });
   if (!employee) return { locationId: null, performedBy: req.userId, name: "System" };
-  return { locationId: employee.locationId, performedBy: req.userId, name: `${employee.firstName} ${employee.lastName}` };
+  return { locationId: await resolveActorLocation(tid, req.userId), performedBy: req.userId, name: `${employee.firstName} ${employee.lastName}` };
 }
 
 async function logActivity(
