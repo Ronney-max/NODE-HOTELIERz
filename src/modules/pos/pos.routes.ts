@@ -7,6 +7,7 @@ import { prisma } from "../../lib/prisma.js";
 import { computeOrderFinancials } from "../../lib/orderTotals.js";
 import { nextTransactionNo } from "../../lib/sequence.js";
 import { resolveEffectiveLocation, employeeLocationId } from "../../lib/location.js";
+import { recordStockMovement, InsufficientStockError } from "../../lib/stockLedger.js";
 
 // POS configuration, stores, and stock all remain scoped to the tenant supplied
 // by the authenticated request context (currently x-tenant-id during scaffolding).
@@ -21,7 +22,11 @@ const settingsSchema = z.object({
   lowStockAlerts: z.boolean(),
 });
 
-const orderSchema = z.object({ tableId: z.string().cuid().optional(), locationId: z.string().cuid().optional(), customerId: z.string().trim().min(1).optional(), notes: z.string().trim().max(500).optional(), discount: z.coerce.number().min(0).default(0), items: z.array(z.object({ menuItemId: z.string().cuid(), quantity: z.coerce.number().int().min(1).max(50), addons: z.array(z.object({ addonId: z.string().cuid(), quantity: z.coerce.number().int().min(1).max(20).default(1) })).default([]) })).min(1) });
+// reservationId is optional "remember this bar tab is for Room 12" — it
+// stamps the checked-in stay onto the order so settlement can default to
+// charging the folio, but it does NOT charge the folio now (a tab isn't
+// paid until the guest is done, and they may still settle in cash).
+const orderSchema = z.object({ tableId: z.string().cuid().optional(), locationId: z.string().cuid().optional(), customerId: z.string().trim().min(1).optional(), reservationId: z.string().trim().min(1).optional(), notes: z.string().trim().max(500).optional(), discount: z.coerce.number().min(0).default(0), items: z.array(z.object({ menuItemId: z.string().cuid(), quantity: z.coerce.number().int().min(1).max(50), addons: z.array(z.object({ addonId: z.string().cuid(), quantity: z.coerce.number().int().min(1).max(20).default(1) })).default([]) })).min(1) });
 const addItemsSchema = z.object({ items: z.array(z.object({ menuItemId: z.string().cuid(), quantity: z.coerce.number().int().min(1).max(50), addons: z.array(z.object({ addonId: z.string().cuid(), quantity: z.coerce.number().int().min(1).max(20).default(1) })).default([]) })).min(1) });
 
 // Bill-to-room is decided at settlement, not order creation — a tab isn't
@@ -209,8 +214,16 @@ posRouter.post("/orders", async (req, res) => {
   const instantServe = location?.servesDirectly === true;
 
   let customerId: string | undefined;
+  let billToReservationId: string | undefined;
   try {
     customerId = await resolveCustomerId(tid, parsed.data.customerId);
+    if (parsed.data.reservationId) {
+      const reservation = await resolveBillableReservation(tid, parsed.data.reservationId);
+      billToReservationId = reservation!.id;
+      // A tab picked to a room adopts that guest as its customer unless one
+      // was explicitly chosen — same rule the settlement ROOM branch uses.
+      customerId = customerId ?? reservation!.customerId;
+    }
   } catch (error) {
     if (error instanceof Error && "status" in error) { res.status((error as Error & { status: number }).status).json({ error: error.message }); return; }
     throw error;
@@ -229,6 +242,7 @@ posRouter.post("/orders", async (req, res) => {
           tableId: parsed.data.tableId,
           locationId: effectiveLocationId,
           customerId,
+          reservationId: billToReservationId,
           notes: parsed.data.notes,
           discount: parsed.data.discount,
           status: instantServe ? "SERVED" : "OPEN",
@@ -278,9 +292,21 @@ posRouter.post("/orders/:id/items", async (req, res) => {
   const addonPrices = new Map(addons.map((addon) => [addon.id, addon.price]));
   const tax = await taxSettingsFor(tid);
 
+  // Same menu item with the same set of add-ons is the *same line* — bump
+  // its quantity instead of stacking a duplicate row on the bill/receipt.
+  // A different add-on selection is a genuinely different line and stays
+  // separate.
+  const addonKey = (list: { addonId: string }[]) => list.map((a) => a.addonId).sort().join("|");
+
   try {
     const updated = await prisma.$transaction(async (tx) => {
       for (const item of parsed.data.items) {
+        const key = addonKey(item.addons);
+        const existing = order.items.find((line) => line.menuItemId === item.menuItemId && addonKey(line.addons) === key);
+        if (existing) {
+          await tx.posOrderItem.update({ where: { id: existing.id }, data: { quantity: { increment: item.quantity } } });
+          continue;
+        }
         await tx.posOrderItem.create({
           data: {
             orderId: order.id,
@@ -356,9 +382,16 @@ async function deductStockForOrder(
   req: { userId?: string },
 ) {
   for (const [productId, requirement] of requirements) {
-    const stock = await tx.productStock.updateMany({ where: { tenantId: tid, productId, locationId, quantity: { gte: requirement.quantity } }, data: { quantity: { decrement: requirement.quantity } } });
-    if (!stock.count) throw new Error(`Not enough ${requirement.name} at this location — transfer more stock in`);
-    await tx.inventoryMovement.create({ data: { tenantId: tid, productId, locationId, type: "DISPATCH", quantity: -requirement.quantity, note: `Used for POS order #${orderNumber}`, performedBy: req.userId } });
+    try {
+      await recordStockMovement(tx, {
+        tenantId: tid, productId, locationId, type: "SALE", quantity: -requirement.quantity,
+        note: `Used for POS order #${orderNumber}`, sourceType: "POS_ORDER", sourceRefId: String(orderNumber),
+        performedBy: req.userId ?? null, label: requirement.name,
+      });
+    } catch (error) {
+      if (error instanceof InsufficientStockError) throw new Error(`Not enough ${requirement.name} at this location — transfer more stock in`);
+      throw error;
+    }
   }
 }
 
@@ -616,21 +649,16 @@ posRouter.post("/retail-orders", async (req, res) => {
   try {
     const order = await prisma.$transaction(async (tx) => {
       let itemsCreate: Prisma.PosOrderItemCreateWithoutOrderInput[];
+      const productNames = new Map<string, string>();
 
       if (channel === "PRODUCTS") {
         if (!effectiveLocationId) throw Object.assign(new Error("Choose which location this sale is for"), { status: 400 });
         const productIds = parsed.data.items.map((item) => item.productId);
         const products = await tx.product.findMany({ where: { id: { in: productIds }, tenantId: tid, isActive: true, sellingPrice: { not: null } } });
         if (products.length !== new Set(productIds).size) throw Object.assign(new Error("Every item must be an active, sellable product from this property"), { status: 400 });
+        for (const p of products) productNames.set(p.id, p.name);
         const prices = new Map(products.map((p) => [p.id, p.sellingPrice!]));
         itemsCreate = parsed.data.items.map((item) => ({ productId: item.productId, quantity: item.quantity, unitPrice: prices.get(item.productId)! }));
-        for (const item of parsed.data.items) {
-          const decremented = await tx.productStock.updateMany({ where: { tenantId: tid, productId: item.productId, locationId: effectiveLocationId, quantity: { gte: item.quantity } }, data: { quantity: { decrement: item.quantity } } });
-          if (!decremented.count) {
-            const product = products.find((p) => p.id === item.productId);
-            throw Object.assign(new Error(`Not enough ${product?.name ?? "stock"} at this location`), { status: 409 });
-          }
-        }
       } else {
         const serviceIds = parsed.data.items.map((item) => item.serviceId);
         const services = await tx.service.findMany({ where: { id: { in: serviceIds }, tenantId: tid, isActive: true } });
@@ -658,7 +686,17 @@ posRouter.post("/retail-orders", async (req, res) => {
 
       if (channel === "PRODUCTS") {
         for (const item of parsed.data.items) {
-          await tx.inventoryMovement.create({ data: { tenantId: tid, productId: item.productId, locationId: effectiveLocationId!, type: "DISPATCH", quantity: -item.quantity, note: `Sold — POS order #${created.orderNumber}`, performedBy: req.userId } });
+          try {
+            await recordStockMovement(tx, {
+              tenantId: tid, productId: item.productId, locationId: effectiveLocationId!, type: "SALE",
+              quantity: -item.quantity, note: `Sold — POS order #${created.orderNumber}`,
+              sourceType: "POS_ORDER", sourceRefId: created.id, performedBy: req.userId ?? null,
+              label: productNames.get(item.productId) ?? "stock",
+            });
+          } catch (error) {
+            if (error instanceof InsufficientStockError) throw Object.assign(new Error(`Not enough ${error.label} at this location`), { status: 409 });
+            throw error;
+          }
         }
       }
       return created;

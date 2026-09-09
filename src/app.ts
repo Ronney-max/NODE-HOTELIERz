@@ -10,6 +10,7 @@ import { errorHandler } from "./middleware/errorHandler.js";
 import { notFound } from "./middleware/notFound.js";
 import { tenantContext } from "./middleware/tenantContext.js";
 import { router } from "./routes/index.js";
+import { platformRouter } from "./modules/platform/platform.routes.js";
 
 export function createApp(): Application {
   const app = express();
@@ -17,12 +18,14 @@ export function createApp(): Application {
   app.use(helmet());
   app.use(
     cors({
-      // In production every tenant is served from its own subdomain
-      // (<slug>.{APP_DOMAIN}), so the allowed origin can't be a single
-      // fixed string — it's CORS_ORIGIN (dev) or any host under APP_DOMAIN.
+      // In production every tenant (and the platform admin app) is served
+      // from its own subdomain of APP_DOMAIN, so the allowed origin can't
+      // be a single fixed string — it's any of CORS_ORIGINS (dev, one per
+      // local Vite server: REACT, the platform admin app, ...) or any host
+      // under APP_DOMAIN.
       origin(origin, callback) {
         if (!origin) { callback(null, true); return; } // non-browser clients (curl, health checks)
-        if (origin === env.CORS_ORIGIN) { callback(null, true); return; }
+        if (env.CORS_ORIGINS.includes(origin)) { callback(null, true); return; }
         if (env.APP_DOMAIN) {
           const host = new URL(origin).hostname;
           if (host === env.APP_DOMAIN || host.endsWith(`.${env.APP_DOMAIN}`)) { callback(null, true); return; }
@@ -51,6 +54,11 @@ export function createApp(): Application {
     helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }),
     express.static(path.resolve(process.cwd(), "uploads"), { immutable: true, maxAge: "365d" })
   );
+
+  // Mounted standalone, before tenantContext — this surface has no tenant
+  // of its own (it's what CREATES tenants) and is gated only by its own
+  // shared-key middleware, never x-tenant-id.
+  app.use("/api/platform", platformRouter);
 
   app.use(tenantContext);
 

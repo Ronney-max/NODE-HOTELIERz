@@ -1,5 +1,5 @@
 import { prisma } from "../lib/prisma.js";
-import { hashSecret } from "../lib/hash.js";
+import { provisionTenantBootstrap } from "../lib/tenantBootstrap.js";
 
 const oneYearFromNow = new Date();
 oneYearFromNow.setFullYear(oneYearFromNow.getFullYear() + 1);
@@ -19,80 +19,14 @@ const tenant = await prisma.tenant.upsert({
   create: { name: "HOTELIER Demo", slug: "hotelier-demo", ...licenseFields },
 });
 
-for (const moduleKey of ["PRODUCTS", "STORE", "POS", "KITCHEN", "ROOMS", "RESERVATIONS", "HOUSEKEEPING", "HR", "REPORTS", "CUSTOMERS"] as const) {
-  await prisma.module.upsert({
-    where: { key: moduleKey },
-    update: {},
-    create: { key: moduleKey, name: moduleKey.replace("_", " ") },
-  });
-  await prisma.tenantModule.upsert({
-    where: { tenantId_moduleKey: { tenantId: tenant.id, moduleKey } },
-    update: { isEnabled: true },
-    create: { tenantId: tenant.id, moduleKey, isEnabled: true },
-  });
-}
-
-const ALL_SECTIONS = ["OVERVIEW", "RECEPTION", "HOUSEKEEPING", "SALES", "KITCHEN", "SERVICE_CENTER", "INVENTORY", "TEAM", "FINANCE", "REPORTS", "SYSTEM"] as const;
-
-for (const role of [
-  { name: "Super Admin", description: "Full access to every section of the workspace.", allowedSections: ALL_SECTIONS },
-  { name: "Manager", description: "Oversees daily operations across the property.", allowedSections: ALL_SECTIONS },
-  { name: "Receptionist", description: "Front desk check-in, reservations, and guest billing.", allowedSections: ["OVERVIEW", "RECEPTION"] },
-  { name: "Chef", description: "Kitchen orders, menu, and recipes.", allowedSections: ["OVERVIEW", "KITCHEN"] },
-  { name: "Waiter", description: "Point of sale, tables, and orders.", allowedSections: ["OVERVIEW", "SALES"] },
-  { name: "Housekeeping", description: "Room tasks and cleanliness tracking.", allowedSections: ["OVERVIEW", "HOUSEKEEPING"] },
-  { name: "Storekeeper", description: "Inventory, stock, and supplier records.", allowedSections: ["OVERVIEW", "INVENTORY"] },
-  { name: "Accountant", description: "Finance, expenses, and reports.", allowedSections: ["OVERVIEW", "FINANCE", "REPORTS"] },
-] as const) {
-  await prisma.role.upsert({
-    where: { tenantId_name: { tenantId: tenant.id, name: role.name } },
-    update: { description: role.description, allowedSections: [...role.allowedSections], isSystemRole: true },
-    create: { tenantId: tenant.id, name: role.name, description: role.description, allowedSections: [...role.allowedSections], isSystemRole: true },
-  });
-}
-
-// Bootstrap login: every tenant gets a default SYSTEM employee (code
-// "SYSTEM", PIN "000000") with the Super Admin role, so a freshly
-// onboarded tenant can always sign in and set up its real staff.
-const superAdminRole = await prisma.role.findUniqueOrThrow({
-  where: { tenantId_name: { tenantId: tenant.id, name: "Super Admin" } },
-});
-
-await prisma.employee.upsert({
-  where: { tenantId_employeeCode: { tenantId: tenant.id, employeeCode: "SYSTEM" } },
-  update: {},
-  create: {
-    tenantId: tenant.id,
-    employeeCode: "SYSTEM",
-    pin: hashSecret("000000"),
-    firstName: "System",
-    lastName: "Administrator",
-    phone: "0000000000",
-    department: "MANAGEMENT",
-    jobTitle: "System Administrator",
-    dateHired: new Date(),
-    salaryAmount: 0,
-    roleId: superAdminRole.id,
-    status: "ACTIVE",
-  },
-});
-
-// A warehouse is just a Location of type STORE — no separate store model.
-// canSell* all false since it doesn't run its own POS.
-await prisma.location.upsert({
-  where: { tenantId_name: { tenantId: tenant.id, name: "Main Store" } },
-  update: {},
-  create: {
-    tenantId: tenant.id, name: "Main Store", type: "STORE", isActive: true,
-    canSellRooms: false, canSellMenu: false, canSellServices: false, canSellProducts: false,
-  },
-});
-
-await prisma.cafeSettings.upsert({
-  where: { tenantId: tenant.id },
-  update: {},
-  create: { tenantId: tenant.id, cafeName: "TANZ Café", currency: "KES" },
-});
+// Everything a real tenant needs (modules, system roles, bootstrap login,
+// default store location, café settings, business profile, payment
+// methods) is shared with the platform admin's own tenant-creation flow —
+// see tenantBootstrap.ts. Only the demo-specific catalog data below
+// (rooms, services, menu, tables) is unique to this local dev seed.
+await prisma.$transaction((tx) =>
+  provisionTenantBootstrap(tx, { tenantId: tenant.id, businessName: "HOTELIER Demo", businessType: "HOTEL" }),
+);
 
 const roomTypeIds = new Map<string, string>();
 for (const roomType of [
@@ -192,19 +126,8 @@ for (const name of ["Transport", "Utilities", "Repairs", "Marketing", "Salary", 
   await prisma.expenseCategory.upsert({ where: { tenantId_name: { tenantId: tenant.id, name } }, update: {}, create: { tenantId: tenant.id, name } });
 }
 
-for (const method of [
-  { name: "Cash", code: "CASH", requiresReference: false, sortOrder: 0 },
-  { name: "M-Pesa", code: "MPESA", requiresReference: true, sortOrder: 1 },
-  { name: "Card", code: "CARD", requiresReference: true, sortOrder: 2 },
-  { name: "Bank Transfer", code: "BANK_TRANSFER", requiresReference: true, sortOrder: 3 },
-  { name: "Cheque", code: "CHEQUE", requiresReference: true, sortOrder: 4 },
-]) {
-  await prisma.paymentMethod.upsert({
-    where: { tenantId_code: { tenantId: tenant.id, code: method.code } },
-    update: {},
-    create: { tenantId: tenant.id, ...method, isSystem: true },
-  });
-}
+// Payment methods (Cash/M-Pesa/Card/Bank Transfer/Cheque) are already
+// created by provisionTenantBootstrap above.
 
 const menu = [
   { category: "Hot drinks", name: "Espresso", description: "Single espresso shot", price: 250, temperature: "HOT" },

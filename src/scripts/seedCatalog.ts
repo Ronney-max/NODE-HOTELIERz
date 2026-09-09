@@ -105,7 +105,7 @@ async function setOpeningStock(productId: string, locationId: string, quantity: 
   if (existing) return;
   await prisma.$transaction([
     prisma.productStock.create({ data: { tenantId: tid, productId, locationId, quantity } }),
-    prisma.inventoryMovement.create({ data: { tenantId: tid, productId, locationId, type: "RECEIPT", quantity, note: "Seed data — opening stock" } }),
+    prisma.inventoryMovement.create({ data: { tenantId: tid, productId, locationId, type: "OPENING_STOCK", quantity, balanceBefore: 0, balanceAfter: quantity, note: "Seed data — opening stock" } }),
   ]);
 }
 

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { requireModule } from "../../middleware/tenantContext.js";
 import { partialNoDefaults } from "../../lib/zod.js";
+import { recordStockMovement, InsufficientStockError } from "../../lib/stockLedger.js";
 
 export const productsRouter = Router();
 productsRouter.use(requireModule("PRODUCTS"));
@@ -47,15 +48,20 @@ const createSchema = z.object({
 });
 const updateSchema = partialNoDefaults(createSchema.omit({ openingStock: true, locationId: true }));
 
+// A hand-entered movement at one location: stock bought in (PURCHASE),
+// stock written off as broken/spoiled/lost (DAMAGE_LOSS), or a plain count
+// correction (ADJUSTMENT, signed). Location-to-location moves use /transfer.
+const MANUAL_MOVEMENT_TYPES = ["PURCHASE", "DAMAGE_LOSS", "ADJUSTMENT"] as const;
 const movementSchema = z.object({
-  type: z.enum(["RECEIPT", "DISPATCH", "ADJUSTMENT"]),
+  type: z.enum(MANUAL_MOVEMENT_TYPES),
   locationId: z.string().trim().min(1),
   quantity: z.coerce.number().finite().refine((value) => value !== 0, "Quantity cannot be zero"),
+  unitCost: z.coerce.number().min(0).optional(),
   note: z.string().trim().max(500).optional(),
   occurredAt: z.coerce.date().optional(),
 }).superRefine((value, context) => {
-  if (["RECEIPT", "DISPATCH"].includes(value.type) && value.quantity < 0) {
-    context.addIssue({ code: "custom", message: "Receipt and dispatch quantities must be positive", path: ["quantity"] });
+  if (value.type === "PURCHASE" && value.quantity < 0) {
+    context.addIssue({ code: "custom", message: "Purchase quantity must be positive", path: ["quantity"] });
   }
 });
 
@@ -174,9 +180,11 @@ productsRouter.post("/", async (req, res, next) => {
     const product = await prisma.$transaction(async (tx) => {
       const created = await tx.product.create({ data: { tenantId: tid, categoryId, ...rest } });
       if (openingStock > 0 && receivingLocationId) {
-        await tx.productStock.create({ data: { tenantId: tid, productId: created.id, locationId: receivingLocationId, quantity: openingStock } });
-        await tx.inventoryMovement.create({
-          data: { tenantId: tid, productId: created.id, locationId: receivingLocationId, type: "RECEIPT", quantity: openingStock, note: "Opening stock", performedBy: req.userId },
+        await recordStockMovement(tx, {
+          tenantId: tid, productId: created.id, locationId: receivingLocationId,
+          type: "OPENING_STOCK", quantity: openingStock, unitCost: rest.unitCost ?? null,
+          note: "Opening stock", sourceType: "PRODUCT_OPENING", sourceRefId: created.id,
+          performedBy: req.userId ?? null,
         });
       }
       return tx.product.findUniqueOrThrow({ where: { id: created.id }, select: productFields });
@@ -224,16 +232,20 @@ productsRouter.get("/:id/movements", async (req, res) => {
   if (!product) { res.status(404).json({ error: "Product not found" }); return; }
   const movements = await prisma.inventoryMovement.findMany({
     where: { productId: product.id, tenantId: tenantId(req) },
-    include: { location: { select: { id: true, name: true } } },
+    include: {
+      location: { select: { id: true, name: true } },
+      employee: { select: { id: true, firstName: true, lastName: true } },
+    },
     orderBy: { occurredAt: "desc" },
   });
   res.json({ product: withTotal(product), movements });
 });
 
-/** Manual stock movement at a single location: receiving, dispatch (stock
- * leaving the business — waste/spoilage/breakage), or a correction. To move
- * stock between two locations, use /transfer. */
-productsRouter.post("/:id/movements", async (req, res) => {
+/** Hand-entered stock movement at a single location: stock bought in
+ * (PURCHASE), a write-off for breakage/spoilage/loss (DAMAGE_LOSS), or a
+ * plain count correction (ADJUSTMENT). To move stock between two locations,
+ * use /transfer. Every path here goes through the stock ledger. */
+productsRouter.post("/:id/movements", async (req, res, next) => {
   const data = movementSchema.safeParse(req.body);
   if (!data.success) { res.status(400).json({ error: "Invalid stock movement", details: data.error.flatten() }); return; }
   const tid = tenantId(req);
@@ -241,37 +253,27 @@ productsRouter.post("/:id/movements", async (req, res) => {
   if (!product) { res.status(404).json({ error: "Product not found" }); return; }
   const location = await assertLocationInTenant(data.data.locationId, tid).catch(() => null);
   if (!location) { res.status(400).json({ error: "Choose a location from this property" }); return; }
-  const { type, locationId, note, occurredAt } = data.data;
-  const signedQuantity = type === "DISPATCH" ? -data.data.quantity : data.data.quantity;
+  const { type, locationId, unitCost, note, occurredAt } = data.data;
+  const signedQuantity = type === "DAMAGE_LOSS" ? -Math.abs(data.data.quantity) : data.data.quantity;
 
-  const result = await prisma.$transaction(async (tx) => {
-    if (signedQuantity < 0) {
-      const decremented = await tx.productStock.updateMany({
-        where: { tenantId: tid, productId: product.id, locationId, quantity: { gte: -signedQuantity } },
-        data: { quantity: { increment: signedQuantity } },
-      });
-      if (!decremented.count) return null;
-    } else {
-      await tx.productStock.upsert({
-        where: { tenantId_productId_locationId: { tenantId: tid, productId: product.id, locationId } },
-        create: { tenantId: tid, productId: product.id, locationId, quantity: signedQuantity },
-        update: { quantity: { increment: signedQuantity } },
-      });
-    }
-    return tx.inventoryMovement.create({
-      data: { tenantId: tid, productId: product.id, locationId, type, quantity: signedQuantity, note, occurredAt, performedBy: req.userId },
-      include: { location: { select: { id: true, name: true } } },
-    });
-  });
-  if (!result) { res.status(400).json({ error: `Not enough stock at ${location.name} for this` }); return; }
-  const updatedProduct = await prisma.product.findUniqueOrThrow({ where: { id: product.id }, select: productFields });
-  res.status(201).json({ movement: result, product: withTotal(updatedProduct) });
+  try {
+    const movement = await prisma.$transaction((tx) => recordStockMovement(tx, {
+      tenantId: tid, productId: product.id, locationId, type, quantity: signedQuantity,
+      unitCost: unitCost ?? null, note: note ?? null, occurredAt,
+      sourceType: "MANUAL", performedBy: req.userId ?? null, label: product.name,
+    }));
+    const updatedProduct = await prisma.product.findUniqueOrThrow({ where: { id: product.id }, select: productFields });
+    res.status(201).json({ movement, product: withTotal(updatedProduct) });
+  } catch (error) {
+    if (error instanceof InsufficientStockError) { res.status(error.status).json({ error: `Not enough ${product.name} at ${location.name} for this` }); return; }
+    next(error);
+  }
 });
 
 /** Moves stock between any two locations. Recorded as a matched pair of
  * movements (one per location) so each location's audit trail fully
  * explains its own balance. */
-productsRouter.post("/:id/transfer", async (req, res) => {
+productsRouter.post("/:id/transfer", async (req, res, next) => {
   const data = transferSchema.safeParse(req.body);
   if (!data.success) { res.status(400).json({ error: "Invalid transfer", details: data.error.flatten() }); return; }
   const tid = tenantId(req);
@@ -283,26 +285,27 @@ productsRouter.post("/:id/transfer", async (req, res) => {
     assertLocationInTenant(toLocationId, tid).catch(() => null),
   ]);
   if (!fromLocation || !toLocation) { res.status(400).json({ error: "Choose two locations from this property" }); return; }
+  const transferNote = note ?? `Transfer ${fromLocation.name} → ${toLocation.name}`;
 
-  const result = await prisma.$transaction(async (tx) => {
-    const debited = await tx.productStock.updateMany({
-      where: { tenantId: tid, productId: product.id, locationId: fromLocationId, quantity: { gte: quantity } },
-      data: { quantity: { decrement: quantity } },
+  try {
+    await prisma.$transaction(async (tx) => {
+      // OUT first — it's the guarded side, so an insufficient balance fails
+      // before anything is credited to the destination.
+      await recordStockMovement(tx, {
+        tenantId: tid, productId: product.id, locationId: fromLocationId, type: "TRANSFER_OUT",
+        quantity: -quantity, note: transferNote, occurredAt, sourceType: "TRANSFER",
+        performedBy: req.userId ?? null, label: product.name,
+      });
+      await recordStockMovement(tx, {
+        tenantId: tid, productId: product.id, locationId: toLocationId, type: "TRANSFER_IN",
+        quantity, note: transferNote, occurredAt, sourceType: "TRANSFER", performedBy: req.userId ?? null,
+      });
     });
-    if (!debited.count) return null;
-    await tx.productStock.upsert({
-      where: { tenantId_productId_locationId: { tenantId: tid, productId: product.id, locationId: toLocationId } },
-      create: { tenantId: tid, productId: product.id, locationId: toLocationId, quantity },
-      update: { quantity: { increment: quantity } },
-    });
-    const transferNote = note ?? `Transferred to ${toLocation.name}`;
-    const [debitMovement] = await Promise.all([
-      tx.inventoryMovement.create({ data: { tenantId: tid, productId: product.id, locationId: fromLocationId, type: "TRANSFER", quantity: -quantity, note: transferNote, occurredAt, performedBy: req.userId } }),
-      tx.inventoryMovement.create({ data: { tenantId: tid, productId: product.id, locationId: toLocationId, type: "TRANSFER", quantity, note: transferNote, occurredAt, performedBy: req.userId } }),
-    ]);
-    return debitMovement;
-  });
-  if (!result) { res.status(400).json({ error: `Not enough stock at ${fromLocation.name} to transfer` }); return; }
+  } catch (error) {
+    if (error instanceof InsufficientStockError) { res.status(400).json({ error: `Not enough ${product.name} at ${fromLocation.name} to transfer` }); return; }
+    next(error);
+    return;
+  }
   const updatedProduct = await prisma.product.findUniqueOrThrow({ where: { id: product.id }, select: productFields });
   res.status(201).json({ product: withTotal(updatedProduct) });
 });
@@ -334,25 +337,21 @@ productsRouter.post("/distribute", async (req, res) => {
 
   try {
     await prisma.$transaction(async (tx) => {
-      const transferNote = note ?? `Distributed to ${toLocation.name}`;
+      const transferNote = note ?? `Distribute ${fromLocation.name} → ${toLocation.name}`;
       for (const item of items) {
-        const debited = await tx.productStock.updateMany({
-          where: { tenantId: tid, productId: item.productId, locationId: fromLocationId, quantity: { gte: item.quantity } },
-          data: { quantity: { decrement: item.quantity } },
+        await recordStockMovement(tx, {
+          tenantId: tid, productId: item.productId, locationId: fromLocationId, type: "TRANSFER_OUT",
+          quantity: -item.quantity, note: transferNote, sourceType: "DISTRIBUTE",
+          performedBy: req.userId ?? null, label: productNames.get(item.productId) ?? "stock",
         });
-        if (!debited.count) throw Object.assign(new Error(`Not enough ${productNames.get(item.productId)} at ${fromLocation.name} to distribute`), { status: 400 });
-        await tx.productStock.upsert({
-          where: { tenantId_productId_locationId: { tenantId: tid, productId: item.productId, locationId: toLocationId } },
-          create: { tenantId: tid, productId: item.productId, locationId: toLocationId, quantity: item.quantity },
-          update: { quantity: { increment: item.quantity } },
+        await recordStockMovement(tx, {
+          tenantId: tid, productId: item.productId, locationId: toLocationId, type: "TRANSFER_IN",
+          quantity: item.quantity, note: transferNote, sourceType: "DISTRIBUTE", performedBy: req.userId ?? null,
         });
-        await Promise.all([
-          tx.inventoryMovement.create({ data: { tenantId: tid, productId: item.productId, locationId: fromLocationId, type: "TRANSFER", quantity: -item.quantity, note: transferNote, performedBy: req.userId } }),
-          tx.inventoryMovement.create({ data: { tenantId: tid, productId: item.productId, locationId: toLocationId, type: "TRANSFER", quantity: item.quantity, note: transferNote, performedBy: req.userId } }),
-        ]);
       }
     });
   } catch (error) {
+    if (error instanceof InsufficientStockError) { res.status(error.status).json({ error: `Not enough ${error.label} at ${fromLocation.name} to distribute` }); return; }
     if (error instanceof Error && "status" in error) { res.status((error as Error & { status: number }).status).json({ error: error.message }); return; }
     throw error;
   }

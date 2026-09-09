@@ -71,11 +71,23 @@ enum HousekeepingTaskType {
   MAINTENANCE
 }
 
-enum InventoryMovementType {
-  RECEIPT
-  DISPATCH
+// Every reason a product's stock at a location can change. The ledger
+// (InventoryMovement) records one row per change with the signed quantity,
+// the balance before/after, and a cash value — nothing edits stock without
+// writing one of these.
+enum StockMovementType {
+  OPENING_STOCK
+  PURCHASE
+  SALE
+  TRANSFER_IN
+  TRANSFER_OUT
+  RETURN
+  DAMAGE_LOSS
   ADJUSTMENT
-  TRANSFER
+  BORROWED_IN
+  RETURNED_BORROWED_STOCK
+  LENT_OUT
+  LOAN_RETURNED
 }
 
 // Which part of the property a category organizes. One shared hierarchy —
@@ -217,6 +229,14 @@ model Tenant {
 
   licenseKey        String        @default(uuid())
   licenseStatus     LicenseStatus @default(TRIAL)
+  // planId points at the shared Plan catalog row this tenant is on.
+  // subscriptionPlan / maxBranches / maxUsers / maxDevices are a
+  // denormalised SNAPSHOT copied from that plan at assignment time —
+  // editable per tenant (deliberate override) and left untouched if the
+  // plan definition later changes. License enforcement reads the snapshot,
+  // never the Plan directly.
+  planId            String?
+  plan              Plan?         @relation(fields: [planId], references: [id], onDelete: SetNull)
   subscriptionPlan  String        @default("Hotelier Standard — Yearly")
   subscriptionStart DateTime      @default(now())
   nextDueDate       DateTime?
@@ -265,6 +285,9 @@ model Tenant {
   reservationActivities ReservationActivity[]
   assets             Asset[]
   assetMovements     AssetMovement[]
+  suppliers          Supplier[]
+  purchases          Purchase[]
+  purchaseRequisitions PurchaseRequisition[]
 }
 
 enum CustomerType {
@@ -934,6 +957,166 @@ model AssetMovement {
   @@index([tenantId, assetId, occurredAt])
 }
 
+// A supplier/vendor the property buys stock from. A plain definitional
+// record for now — Purchases / Goods Received will reference it later.
+// Carries createdBy/updatedBy from day one, per the audit-trail precedent
+// set by Asset.
+model Supplier {
+  id            String  @id @default(cuid())
+  tenantId      String
+  tenant        Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name          String
+  contactPerson String?
+  phone         String?
+  email         String?
+  address       String?
+  city          String?
+  taxPin        String?
+  paymentTerms  String?
+  notes         String?
+  // Running account balance with this supplier — what the property owes
+  // them (positive) or has in credit (negative). Not wired to anything yet;
+  // Purchases / supplier payments will maintain it later.
+  balance       Decimal @default(0) @db.Decimal(12, 2)
+  isActive      Boolean @default(true)
+  createdBy     String?
+  createdByEmployee Employee? @relation("SupplierCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedBy     String?
+  updatedByEmployee Employee? @relation("SupplierUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  purchases     Purchase[]
+  requisitions  PurchaseRequisition[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, isActive])
+}
+
+enum PurchaseRequisitionStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  CONVERTED
+  CANCELLED
+}
+
+// A storekeeper's request to buy a set of items — the document that kicks
+// off procurement, before any supplier is committed. Lifecycle: DRAFT ->
+// SUBMITTED -> APPROVED/REJECTED by an accountant -> CONVERTED once a
+// Purchase (PO) is raised from it. Estimated costs only; the real prices
+// land on the Purchase. Line items must reference catalog Products.
+model PurchaseRequisition {
+  id            String                    @id @default(cuid())
+  tenantId      String
+  tenant        Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  requisitionNo String
+  status        PurchaseRequisitionStatus @default(DRAFT)
+  requisitionDate DateTime                @default(now())
+  neededBy      DateTime?
+  purpose       String?
+  notes         String?
+  // A non-binding hint for whoever raises the eventual PO.
+  suggestedSupplierId String?
+  suggestedSupplier   Supplier?           @relation(fields: [suggestedSupplierId], references: [id], onDelete: SetNull)
+  estimatedTotal Decimal                  @default(0) @db.Decimal(12, 2)
+  submittedAt   DateTime?
+  reviewedBy    String?
+  reviewedByEmployee Employee?            @relation("RequisitionReviewedBy", fields: [reviewedBy], references: [id], onDelete: SetNull)
+  reviewedAt    DateTime?
+  reviewNote    String?
+  createdBy     String?
+  createdByEmployee Employee?             @relation("RequisitionCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedBy     String?
+  updatedByEmployee Employee?             @relation("RequisitionUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+  createdAt     DateTime                  @default(now())
+  updatedAt     DateTime                  @updatedAt
+  items         PurchaseRequisitionItem[]
+  purchase      Purchase?
+
+  @@unique([tenantId, requisitionNo])
+  @@index([tenantId, status])
+  @@index([tenantId, requisitionDate])
+}
+
+model PurchaseRequisitionItem {
+  id                String              @id @default(cuid())
+  requisitionId     String
+  requisition       PurchaseRequisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+  productId         String
+  product           Product             @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity          Decimal             @db.Decimal(12, 3)
+  estimatedUnitCost Decimal             @default(0) @db.Decimal(12, 2)
+  lineTotal         Decimal             @default(0) @db.Decimal(12, 2)
+  note              String?
+  createdAt         DateTime            @default(now())
+
+  @@index([requisitionId])
+}
+
+enum PurchaseStatus {
+  DRAFT
+  ORDERED
+  RECEIVED
+  CANCELLED
+}
+
+// A purchase order raised against one supplier. A document only for now —
+// marking it RECEIVED does NOT yet move stock, post to the ledger, or touch
+// the supplier balance (that arrives with the Goods Received tab). Totals
+// are a snapshot recomputed from the line items on every write:
+// subtotal = sum(lineTotal), taxAmount = subtotal * taxRate/100,
+// total = subtotal + taxAmount. Line items must reference catalog Products.
+model Purchase {
+  id            String         @id @default(cuid())
+  tenantId      String
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  purchaseNo    String
+  supplierId    String
+  supplier      Supplier       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  status        PurchaseStatus @default(DRAFT)
+  orderDate     DateTime       @default(now())
+  expectedDate  DateTime?
+  reference     String?
+  notes         String?
+  taxRate       Decimal        @default(0) @db.Decimal(5, 2)
+  subtotal      Decimal        @default(0) @db.Decimal(12, 2)
+  taxAmount     Decimal        @default(0) @db.Decimal(12, 2)
+  total         Decimal        @default(0) @db.Decimal(12, 2)
+  // Set when this PO was created by converting an approved requisition.
+  requisitionId String?              @unique
+  requisition   PurchaseRequisition? @relation(fields: [requisitionId], references: [id], onDelete: SetNull)
+  orderedAt     DateTime?
+  receivedAt    DateTime?
+  createdBy     String?
+  createdByEmployee Employee?  @relation("PurchaseCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  updatedBy     String?
+  updatedByEmployee Employee?  @relation("PurchaseUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  items         PurchaseItem[]
+
+  @@unique([tenantId, purchaseNo])
+  @@index([tenantId, status])
+  @@index([tenantId, supplierId])
+  @@index([tenantId, orderDate])
+}
+
+model PurchaseItem {
+  id         String   @id @default(cuid())
+  purchaseId String
+  purchase   Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity   Decimal  @db.Decimal(12, 3)
+  unitCost   Decimal  @default(0) @db.Decimal(12, 2)
+  lineTotal  Decimal  @default(0) @db.Decimal(12, 2)
+  note       String?
+  createdAt  DateTime @default(now())
+
+  @@index([purchaseId])
+}
+
 model CafeSettings {
   id               String   @id @default(cuid())
   tenantId         String   @unique
@@ -1014,6 +1197,8 @@ model Product {
   recipeIngredients RecipeIngredient[]
   stocks            ProductStock[]
   orderItems        PosOrderItem[]
+  purchaseItems     PurchaseItem[]
+  requisitionItems  PurchaseRequisitionItem[]
 
   @@unique([tenantId, sku])
   @@unique([tenantId, barcode])
@@ -1040,23 +1225,39 @@ model ProductStock {
   @@index([tenantId, locationId])
 }
 
+// The stock ledger: one immutable row per change to a product's balance at
+// one location. `quantity` is signed (+ in, - out); `balanceBefore` +
+// `quantity` = `balanceAfter` for that (product, location). `value` is the
+// cash worth of the movement (|quantity| * unitCost, unitCost defaulting to
+// the product's valuation cost). Written only via recordStockMovement().
 model InventoryMovement {
-  id          String                @id @default(cuid())
-  tenantId    String
-  productId   String
-  locationId  String
-  type        InventoryMovementType
-  quantity    Decimal               @db.Decimal(12, 3)
-  note        String?
-  performedBy String?
-  occurredAt  DateTime              @default(now())
-  createdAt   DateTime              @default(now())
-  tenant      Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  product     Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
-  location    Location              @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  id            String           @id @default(cuid())
+  tenantId      String
+  productId     String
+  locationId    String
+  type          StockMovementType
+  quantity      Decimal          @db.Decimal(12, 3)
+  balanceBefore Decimal?         @db.Decimal(12, 3)
+  balanceAfter  Decimal?         @db.Decimal(12, 3)
+  unitCost      Decimal?         @db.Decimal(12, 2)
+  value         Decimal?         @db.Decimal(12, 2)
+  note          String?
+  // Where this movement came from — e.g. POS_ORDER, TRANSFER, GOODS_RECEIVED,
+  // PRODUCT_OPENING, MANUAL — plus the id of that source row when there is one.
+  sourceType    String?
+  sourceRefId   String?
+  performedBy   String?
+  employee      Employee?        @relation(fields: [performedBy], references: [id], onDelete: SetNull)
+  occurredAt    DateTime         @default(now())
+  createdAt     DateTime         @default(now())
+  tenant        Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product       Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  location      Location         @relation(fields: [locationId], references: [id], onDelete: Restrict)
 
+  @@index([tenantId, occurredAt])
   @@index([tenantId, productId, occurredAt])
   @@index([tenantId, locationId, occurredAt])
+  @@index([tenantId, type, occurredAt])
 }
 
 enum LocationType {
@@ -1188,6 +1389,38 @@ model PosOrder {
   @@index([reservationId])
   @@index([tableId])
   @@index([locationId])
+  @@index([customerId])
+}
+
+enum PlanBillingType {
+  // Recurring monthly subscription — uses monthlyPrice.
+  MONTHLY
+  // One-off purchase (uses oneTimePrice) plus an annualMaintenanceFee
+  // billed yearly thereafter.
+  ONE_TIME
+}
+
+// The shared subscription catalog TANZ staff maintain in the platform admin
+// app. Platform-level — no tenantId. A Tenant references exactly one Plan
+// (Tenant.planId) and copies its limits into a local snapshot on
+// assignment; see the comment on Tenant.planId.
+model Plan {
+  id                   String          @id @default(cuid())
+  name                 String          @unique
+  billingType          PlanBillingType @default(MONTHLY)
+  currency             Currency        @default(KES)
+  monthlyPrice         Decimal         @default(0) @db.Decimal(12, 2)
+  oneTimePrice         Decimal         @default(0) @db.Decimal(12, 2)
+  annualMaintenanceFee Decimal         @default(0) @db.Decimal(12, 2)
+  supportLevel         String?
+  maxBranches          Int             @default(1)
+  maxUsers             Int             @default(10)
+  maxDevices           Int             @default(10)
+  description          String?
+  isActive             Boolean         @default(true)
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+  tenants              Tenant[]
 }
 
 // A physical seating spot in the restaurant/bar. One active (non-final)
@@ -1426,6 +1659,14 @@ model Employee {
   createdAssets       Asset[] @relation("AssetCreatedBy")
   updatedAssets       Asset[] @relation("AssetUpdatedBy")
   assetMovements      AssetMovement[]
+  createdSuppliers    Supplier[] @relation("SupplierCreatedBy")
+  updatedSuppliers    Supplier[] @relation("SupplierUpdatedBy")
+  createdPurchases    Purchase[] @relation("PurchaseCreatedBy")
+  updatedPurchases    Purchase[] @relation("PurchaseUpdatedBy")
+  createdRequisitions PurchaseRequisition[] @relation("RequisitionCreatedBy")
+  updatedRequisitions PurchaseRequisition[] @relation("RequisitionUpdatedBy")
+  reviewedRequisitions PurchaseRequisition[] @relation("RequisitionReviewedBy")
+  inventoryMovements  InventoryMovement[]
 
   // Compensation
   salaryType        SalaryType    @default(MONTHLY)
@@ -1510,4 +1751,32 @@ model BusinessProfile {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// TANZ staff who sign in to the standalone platform admin app (tenant
+// creation, license management). This sits ABOVE every tenant — there's no
+// tenantId here — and replaces the old single shared PLATFORM_ADMIN_KEY
+// with real per-person email + password accounts. Password is a scrypt
+// hash in the same `salt:hash` format as Employee.pin (see lib/hash.ts).
+model PlatformAdmin {
+  id          String            @id @default(cuid())
+  email       String            @unique
+  password    String
+  name        String
+  isActive    Boolean           @default(true)
+  lastLoginAt DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  sessions    PlatformSession[]
+}
+
+model PlatformSession {
+  id        String        @id @default(cuid())
+  token     String        @unique
+  adminId   String
+  admin     PlatformAdmin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime      @default(now())
+
+  @@index([adminId])
 }
