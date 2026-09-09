@@ -15,7 +15,9 @@ const loginSchema = z.object({
 
 const roleSelect = { select: { id: true, name: true, allowedSections: true } } as const;
 const locationsSelect = { select: { id: true, name: true } } as const;
+const defaultLocationSelect = { select: { id: true, name: true } } as const;
 const departmentSelect = { select: { id: true, name: true } } as const;
+const employeeInclude = { role: roleSelect, locations: locationsSelect, defaultLocation: defaultLocationSelect, department: departmentSelect } as const;
 
 const tenantId = (req: { tenantId?: string }) => {
   if (!req.tenantId) throw new Error("Tenant context is required");
@@ -33,6 +35,7 @@ function publicEmployee(employee: {
   department: { id: string; name: string } | null;
   role: { id: string; name: string; allowedSections: string[] } | null;
   locations: { id: string; name: string }[];
+  defaultLocation: { id: string; name: string } | null;
 }) {
   return {
     id: employee.id,
@@ -43,6 +46,7 @@ function publicEmployee(employee: {
     department: employee.department?.name ?? null,
     role: employee.role,
     locations: employee.locations,
+    defaultLocation: employee.defaultLocation,
   };
 }
 
@@ -52,7 +56,7 @@ authRouter.post("/login", async (req, res, next) => {
   try {
     const employee = await prisma.employee.findFirst({
       where: { tenantId: tenantId(req), employeeCode: { equals: data.data.employeeCode, mode: "insensitive" } },
-      include: { role: roleSelect, locations: locationsSelect, department: departmentSelect },
+      include: employeeInclude,
     });
     if (!employee || employee.status !== "ACTIVE" || !verifySecret(data.data.pin, employee.pin)) {
       res.status(401).json({ error: "Incorrect employee code or PIN" });
@@ -70,7 +74,7 @@ authRouter.post("/login", async (req, res, next) => {
 authRouter.get("/me", async (req, res) => {
   const token = bearerToken(req);
   if (!token) { res.status(401).json({ error: "Not authenticated" }); return; }
-  const session = await prisma.session.findUnique({ where: { token }, include: { employee: { include: { role: roleSelect, locations: locationsSelect, department: departmentSelect } } } });
+  const session = await prisma.session.findUnique({ where: { token }, include: { employee: { include: employeeInclude } } });
   if (!session || session.expiresAt < new Date()) { res.status(401).json({ error: "Session expired" }); return; }
   res.json({ user: publicEmployee(session.employee), tenantId: session.tenantId, expiresAt: session.expiresAt });
 });
@@ -79,4 +83,35 @@ authRouter.post("/logout", async (req, res) => {
   const token = bearerToken(req);
   if (token) await prisma.session.deleteMany({ where: { token } });
   res.status(204).send();
+});
+
+const setLocationSchema = z.object({ locationId: z.string().trim().min(1).nullable() });
+
+/** The signed-in employee switches (or clears) their default POS location.
+ * Must be one they're assigned to — or null. Returns the refreshed user. */
+authRouter.patch("/me/location", async (req, res, next) => {
+  const token = bearerToken(req);
+  if (!token) { res.status(401).json({ error: "Not authenticated" }); return; }
+  const data = setLocationSchema.safeParse(req.body);
+  if (!data.success) { res.status(400).json({ error: "Invalid location", details: data.error.flatten() }); return; }
+  try {
+    const session = await prisma.session.findUnique({ where: { token }, include: { employee: { select: { id: true, locations: { select: { id: true } } } } } });
+    if (!session || session.expiresAt < new Date()) { res.status(401).json({ error: "Session expired" }); return; }
+    const { locationId } = data.data;
+    if (locationId) {
+      const assigned = session.employee.locations;
+      if (assigned.length > 0) {
+        if (!assigned.some((l) => l.id === locationId)) { res.status(400).json({ error: "You can only pick a location you're assigned to" }); return; }
+      } else {
+        // Unrestricted employee — any active location in the property is fine.
+        const ok = await prisma.location.findFirst({ where: { id: locationId, tenantId: session.tenantId, isActive: true }, select: { id: true } });
+        if (!ok) { res.status(400).json({ error: "Choose an active location from this property" }); return; }
+      }
+    }
+    await prisma.employee.update({ where: { id: session.employee.id }, data: { defaultLocationId: locationId } });
+    const employee = await prisma.employee.findUniqueOrThrow({ where: { id: session.employee.id }, include: employeeInclude });
+    res.json({ user: publicEmployee(employee) });
+  } catch (error) {
+    next(error);
+  }
 });

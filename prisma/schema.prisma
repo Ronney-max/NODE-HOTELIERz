@@ -1288,6 +1288,7 @@ model Location {
   updatedAt       DateTime     @updatedAt
   menuItems       MenuItem[]
   employees       Employee[]   @relation("LocationStaff")
+  defaultForEmployees Employee[] @relation("EmployeeDefaultLocation")
   orders          PosOrder[]
   transactions    Transaction[]
   expenses        Expense[]
@@ -1597,6 +1598,11 @@ model Employee {
   // restriction (can work at any location; the POS asks which each time);
   // one or more restricts them to that set.
   locations           Location[]         @relation("LocationStaff")
+  // The location the POS pre-selects for this employee — one of `locations`,
+  // or null. A single-location employee's is locked to it; a multi-location
+  // one starts here and can switch on the fly (which updates this).
+  defaultLocationId   String?
+  defaultLocation     Location?          @relation("EmployeeDefaultLocation", fields: [defaultLocationId], references: [id], onDelete: SetNull)
   managedLocations    Location[]         @relation("LocationManager")
   sessions            Session[]
   createdReservations Reservation[] @relation("ReservationCreatedBy")
