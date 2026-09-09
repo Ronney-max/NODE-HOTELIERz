@@ -33,6 +33,13 @@ const SYSTEM_PAYMENT_METHODS = [
   { name: "Cheque", code: "CHEQUE", requiresReference: true, sortOrder: 4 },
 ] as const;
 
+// A starter set of departments every new tenant gets; fully CRUD-able after
+// onboarding. "Management" is the fallback the bootstrap admin is filed under.
+export const DEFAULT_DEPARTMENTS = [
+  "Reception", "Housekeeping", "Kitchen", "Sales", "Service Center",
+  "Inventory", "Finance", "Management", "Maintenance", "Security",
+] as const;
+
 export type ProvisionTenantInput = {
   tenantId: string;
   businessName: string;
@@ -91,11 +98,22 @@ export async function provisionTenantBootstrap(
     });
   }
 
+  for (const name of DEFAULT_DEPARTMENTS) {
+    await tx.department.upsert({
+      where: { tenantId_name: { tenantId, name } },
+      update: {},
+      create: { tenantId, name },
+    });
+  }
+
   // Bootstrap login: every tenant gets a default SYSTEM employee with the
   // Super Admin role, so a freshly onboarded tenant can always sign in and
   // set up its real staff.
   const superAdminRole = await tx.role.findUniqueOrThrow({
     where: { tenantId_name: { tenantId, name: "Super Admin" } },
+  });
+  const managementDept = await tx.department.findUniqueOrThrow({
+    where: { tenantId_name: { tenantId, name: "Management" } },
   });
   const bootstrapPin = input.bootstrapPin ?? "000000";
   await tx.employee.upsert({
@@ -108,7 +126,7 @@ export async function provisionTenantBootstrap(
       firstName: "System",
       lastName: "Administrator",
       phone: "0000000000",
-      department: "MANAGEMENT",
+      departmentId: managementDept.id,
       jobTitle: "System Administrator",
       dateHired: new Date(),
       salaryAmount: 0,

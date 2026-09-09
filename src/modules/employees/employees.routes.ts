@@ -10,7 +10,6 @@ export const employeesRouter = Router();
 employeesRouter.use(requireModule("HR"));
 
 const genders = ["MALE", "FEMALE", "OTHER"] as const;
-const departments = ["RECEPTION", "HOUSEKEEPING", "KITCHEN", "SALES", "SERVICE_CENTER", "INVENTORY", "FINANCE", "MANAGEMENT", "MAINTENANCE", "SECURITY"] as const;
 const employmentTypes = ["FULL_TIME", "PART_TIME", "CASUAL", "CONTRACT", "INTERN"] as const;
 const statuses = ["ACTIVE", "ON_LEAVE", "SUSPENDED", "TERMINATED"] as const;
 const salaryTypes = ["MONTHLY", "DAILY", "HOURLY"] as const;
@@ -35,7 +34,7 @@ const createSchema = z.object({
   alternativePhone: optionalText(30),
   email: optionalEmail,
   address: optionalText(255),
-  department: z.enum(departments),
+  departmentId: z.string().trim().min(1, "Choose a department"),
   jobTitle: z.string().trim().min(1).max(80),
   employmentType: z.enum(employmentTypes).default("FULL_TIME"),
   status: z.enum(statuses).default("ACTIVE"),
@@ -60,7 +59,7 @@ const createSchema = z.object({
 const updateSchema = partialNoDefaults(createSchema).omit({ pin: true }).extend({ pin: z.string().trim().min(4).max(8).optional() });
 const listSchema = z.object({
   search: z.string().trim().max(100).optional(),
-  department: z.enum(departments).optional(),
+  departmentId: optionalId,
   status: z.enum(statuses).optional(),
 });
 
@@ -81,7 +80,8 @@ const publicFields = {
   alternativePhone: true,
   email: true,
   address: true,
-  department: true,
+  departmentId: true,
+  department: { select: { id: true, name: true } },
   jobTitle: true,
   employmentType: true,
   status: true,
@@ -127,13 +127,19 @@ async function assertLocationInTenant(locationId: string | undefined, tenant: st
   if (!location) throw Object.assign(new Error("Selected location was not found"), { status: 400 });
 }
 
+async function assertDepartmentInTenant(departmentId: string | undefined, tenant: string) {
+  if (!departmentId) return;
+  const department = await prisma.department.findFirst({ where: { id: departmentId, tenantId: tenant }, select: { id: true } });
+  if (!department) throw Object.assign(new Error("Selected department was not found"), { status: 400 });
+}
+
 employeesRouter.get("/", async (req, res) => {
   const query = listSchema.safeParse(req.query);
   if (!query.success) { res.status(400).json({ error: "Invalid employee filters", details: query.error.flatten() }); return; }
-  const { search, department, status } = query.data;
+  const { search, departmentId, status } = query.data;
   const where: Prisma.EmployeeWhereInput = {
     tenantId: tenantId(req),
-    ...(department ? { department } : {}),
+    ...(departmentId ? { departmentId } : {}),
     ...(status ? { status } : {}),
     ...(search ? { OR: [
       { firstName: { contains: search, mode: "insensitive" } },
@@ -168,6 +174,7 @@ employeesRouter.post("/", async (req, res, next) => {
     await assertSupervisorInTenant(supervisorId, tenantId(req));
     await assertRoleInTenant(roleId, tenantId(req));
     await assertLocationInTenant(locationId, tenantId(req));
+    await assertDepartmentInTenant(employeeData.departmentId, tenantId(req));
     const employee = await prisma.employee.create({
       data: { tenantId: tenantId(req), ...employeeData, supervisorId: supervisorId ?? null, roleId: roleId ?? null, locationId: locationId ?? null, pin: hashSecret(pin) },
       select: publicFields,
@@ -188,6 +195,7 @@ employeesRouter.patch("/:id", async (req, res, next) => {
     if (supervisorId !== undefined) await assertSupervisorInTenant(supervisorId, tenantId(req), req.params.id);
     if (roleId !== undefined) await assertRoleInTenant(roleId, tenantId(req));
     if (locationId !== undefined) await assertLocationInTenant(locationId, tenantId(req));
+    if (employeeData.departmentId !== undefined) await assertDepartmentInTenant(employeeData.departmentId, tenantId(req));
     const updated = await prisma.employee.updateMany({
       where: { id: req.params.id, tenantId: tenantId(req) },
       data: { ...employeeData, ...(supervisorId !== undefined ? { supervisorId: supervisorId ?? null } : {}), ...(roleId !== undefined ? { roleId: roleId ?? null } : {}), ...(locationId !== undefined ? { locationId: locationId ?? null } : {}), ...(pin ? { pin: hashSecret(pin) } : {}) },

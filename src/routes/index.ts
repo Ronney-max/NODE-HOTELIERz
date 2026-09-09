@@ -27,6 +27,7 @@ import { purchaseRequisitionsRouter } from "../modules/purchase-requisitions/pur
 import { stockLedgerRouter } from "../modules/stock-ledger/stock-ledger.routes.js";
 import { menuRouter } from "../modules/menu/menu.routes.js";
 import { employeesRouter } from "../modules/employees/employees.routes.js";
+import { departmentsRouter } from "../modules/departments/departments.routes.js";
 import { businessProfileRouter } from "../modules/business-profile/business-profile.routes.js";
 import { tenantRouter } from "../modules/tenant/tenant.routes.js";
 import { rolesRouter } from "../modules/roles/roles.routes.js";
@@ -65,6 +66,7 @@ router.use("/purchase-requisitions", purchaseRequisitionsRouter);
 router.use("/stock-ledger", stockLedgerRouter);
 router.use("/menu", menuRouter);
 router.use("/employees", employeesRouter);
+router.use("/departments", departmentsRouter);
 router.use("/business-profile", businessProfileRouter);
 router.use("/tenant", tenantRouter);
 router.use("/roles", rolesRouter);

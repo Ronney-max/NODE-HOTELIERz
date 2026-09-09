@@ -32,6 +32,15 @@ const mainStore = await prisma.location.findFirst({ where: { tenantId: tenant.id
 const roles = await prisma.role.findMany({ where: { tenantId: tenant.id } });
 const roleId = (name: string) => roles.find((r) => r.name === name)?.id;
 
+const departments = await prisma.department.findMany({ where: { tenantId: tenant.id } });
+// "SERVICE_CENTER" -> "Service Center", "SALES" -> "Sales"
+const deptId = (planDept: string) => {
+  const name = planDept.split("_").map((w) => w[0] + w.slice(1).toLowerCase()).join(" ");
+  const found = departments.find((d) => d.name === name);
+  if (!found) throw new Error(`Department "${name}" is not seeded for this tenant — start the API once so provisionTenantBootstrap creates the default set.`);
+  return found.id;
+};
+
 type Plan = {
   role: string;
   department: "RECEPTION" | "HOUSEKEEPING" | "KITCHEN" | "SALES" | "SERVICE_CENTER" | "INVENTORY" | "FINANCE" | "MANAGEMENT" | "MAINTENANCE" | "SECURITY";
@@ -82,7 +91,7 @@ for (const plan of plans) {
   for (const person of plan.people) {
     await prisma.employee.upsert({
       where: { tenantId_employeeCode: { tenantId: tenant.id, employeeCode: person.code } },
-      update: { roleId: rid, locationId: person.locationId ?? null, department: plan.department, jobTitle: plan.jobTitle },
+      update: { roleId: rid, locationId: person.locationId ?? null, departmentId: deptId(plan.department), jobTitle: plan.jobTitle },
       create: {
         tenantId: tenant.id,
         employeeCode: person.code,
@@ -90,7 +99,7 @@ for (const plan of plans) {
         firstName: person.firstName,
         lastName: person.lastName,
         phone: person.phone,
-        department: plan.department,
+        departmentId: deptId(plan.department),
         jobTitle: plan.jobTitle,
         dateHired,
         salaryAmount: 30000,
