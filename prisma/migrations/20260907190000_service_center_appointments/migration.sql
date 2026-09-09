@@ -86,18 +86,6 @@ CREATE TABLE "Membership" (
 );
 
 -- CreateTable
-CREATE TABLE "PaymentMethod" (
-    "id" TEXT NOT NULL,
-    "tenantId" TEXT NOT NULL,
-    "name" TEXT NOT NULL,
-    "isActive" BOOLEAN NOT NULL DEFAULT true,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "PaymentMethod_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
 CREATE TABLE "MembershipPayment" (
     "id" TEXT NOT NULL,
     "tenantId" TEXT NOT NULL,
@@ -153,9 +141,6 @@ CREATE UNIQUE INDEX "MembershipPlan_tenantId_name_key" ON "MembershipPlan"("tena
 CREATE INDEX "Membership_tenantId_customerId_status_idx" ON "Membership"("tenantId", "customerId", "status");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "PaymentMethod_tenantId_name_key" ON "PaymentMethod"("tenantId", "name");
-
--- CreateIndex
 CREATE INDEX "MembershipPayment_tenantId_membershipId_createdAt_idx" ON "MembershipPayment"("tenantId", "membershipId", "createdAt");
 
 -- CreateIndex
@@ -187,9 +172,6 @@ ALTER TABLE "Membership" ADD CONSTRAINT "Membership_customerId_fkey" FOREIGN KEY
 
 -- AddForeignKey
 ALTER TABLE "Membership" ADD CONSTRAINT "Membership_planId_fkey" FOREIGN KEY ("planId") REFERENCES "MembershipPlan"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "PaymentMethod" ADD CONSTRAINT "PaymentMethod_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "MembershipPayment" ADD CONSTRAINT "MembershipPayment_tenantId_fkey" FOREIGN KEY ("tenantId") REFERENCES "Tenant"("id") ON DELETE CASCADE ON UPDATE CASCADE;

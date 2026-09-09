@@ -409,7 +409,8 @@ serviceCenterRouter.post("/payment-methods", async (req, res) => {
   const tid = tenantId(req);
   const duplicate = await prisma.paymentMethod.findFirst({ where: { tenantId: tid, name: { equals: parsed.data.name, mode: "insensitive" } } });
   if (duplicate) { res.status(409).json({ error: "A payment method with this name already exists" }); return; }
-  const paymentMethod = await prisma.paymentMethod.create({ data: { tenantId: tid, ...parsed.data }, include: { _count: { select: { membershipPayments: true, appointments: true } } } });
+  const code = `SC_${parsed.data.name.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_|_$/g, "")}`;
+  const paymentMethod = await prisma.paymentMethod.create({ data: { tenantId: tid, code, ...parsed.data }, include: { _count: { select: { membershipPayments: true, appointments: true } } } });
   res.status(201).json({ paymentMethod });
 });
 

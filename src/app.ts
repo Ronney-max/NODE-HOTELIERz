@@ -1,3 +1,4 @@
+import path from "node:path";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import express, { type Application } from "express";
@@ -9,6 +10,7 @@ import { errorHandler } from "./middleware/errorHandler.js";
 import { notFound } from "./middleware/notFound.js";
 import { tenantContext } from "./middleware/tenantContext.js";
 import { router } from "./routes/index.js";
+import { platformRouter } from "./modules/platform/platform.routes.js";
 
 export function createApp(): Application {
   const app = express();
@@ -16,7 +18,20 @@ export function createApp(): Application {
   app.use(helmet());
   app.use(
     cors({
-      origin: env.CORS_ORIGIN,
+      // In production every tenant (and the platform admin app) is served
+      // from its own subdomain of APP_DOMAIN, so the allowed origin can't
+      // be a single fixed string — it's any of CORS_ORIGINS (dev, one per
+      // local Vite server: REACT, the platform admin app, ...) or any host
+      // under APP_DOMAIN.
+      origin(origin, callback) {
+        if (!origin) { callback(null, true); return; } // non-browser clients (curl, health checks)
+        if (env.CORS_ORIGINS.includes(origin)) { callback(null, true); return; }
+        if (env.APP_DOMAIN) {
+          const host = new URL(origin).hostname;
+          if (host === env.APP_DOMAIN || host.endsWith(`.${env.APP_DOMAIN}`)) { callback(null, true); return; }
+        }
+        callback(new Error("Not allowed by CORS"));
+      },
       credentials: true,
     })
   );
@@ -27,6 +42,24 @@ export function createApp(): Application {
 
   app.use(express.json());
   app.use(cookieParser());
+
+  // Scoped CORP relaxation: the global helmet() above defaults to
+  // Cross-Origin-Resource-Policy: same-origin, which would silently block
+  // <img src> loading an uploaded logo when the frontend is served from a
+  // different origin/subdomain than the API (true even in dev: :5173 vs
+  // :4000). This second helmet() call only changes that one header, only
+  // for /uploads responses — every other route keeps the strict default.
+  app.use(
+    "/uploads",
+    helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }),
+    express.static(path.resolve(process.cwd(), "uploads"), { immutable: true, maxAge: "365d" })
+  );
+
+  // Mounted standalone, before tenantContext — this surface has no tenant
+  // of its own (it's what CREATES tenants) and is gated only by its own
+  // shared-key middleware, never x-tenant-id.
+  app.use("/api/platform", platformRouter);
+
   app.use(tenantContext);
 
   app.use("/api", router);

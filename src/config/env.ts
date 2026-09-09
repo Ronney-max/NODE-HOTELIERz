@@ -8,6 +8,14 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4000),
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
   CORS_ORIGIN: z.string().min(1).default("http://localhost:5173"),
+  APP_DOMAIN: z.string().trim().min(1).optional(),
+  // Bootstrap credentials for the first platform admin account, consumed
+  // only by `npm run seed:platform-admin` (see that script). The running
+  // app never reads these — platform admins authenticate against
+  // PlatformAdmin rows via email + password.
+  PLATFORM_ADMIN_EMAIL: z.string().trim().toLowerCase().email().optional(),
+  PLATFORM_ADMIN_PASSWORD: z.string().min(8).optional(),
+  PLATFORM_ADMIN_NAME: z.string().trim().min(1).optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -17,5 +25,11 @@ if (!parsed.success) {
   throw new Error("Invalid environment variables");
 }
 
-export const env = parsed.data;
+export const env = {
+  ...parsed.data,
+  // Comma-separated so more than one dev server (REACT on :5173/:5174, the
+  // standalone platform admin app on its own port) can all be allowed in
+  // local development without needing APP_DOMAIN wildcard matching.
+  CORS_ORIGINS: parsed.data.CORS_ORIGIN.split(",").map((origin) => origin.trim()).filter(Boolean),
+};
 export type Env = typeof env;

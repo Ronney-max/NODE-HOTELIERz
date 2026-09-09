@@ -2,23 +2,91 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { requireModule } from "../../middleware/tenantContext.js";
+import { partialNoDefaults } from "../../lib/zod.js";
 
 export const menuRouter = Router();
 menuRouter.use(requireModule("POS"));
-const categorySchema = z.object({ name: z.string().trim().min(2).max(60), sortOrder: z.coerce.number().int().min(0).default(0) });
-const itemSchema = z.object({ categoryId: z.string().cuid(), inventoryItemId: z.string().cuid().nullable().optional(), name: z.string().trim().min(2).max(120), description: z.string().trim().max(280).nullable().optional(), price: z.coerce.number().positive(), temperature: z.enum(["HOT", "COLD", "OTHER"]).default("OTHER"), isAvailable: z.boolean().default(true) });
-const ingredientsSchema = z.object({ ingredients: z.array(z.object({ inventoryItemId: z.string().cuid(), quantity: z.coerce.number().positive() })).min(1) });
+
+// Menu item categories live in the shared Category table (scope=RESTAURANT),
+// managed via /categories — no separate category CRUD here.
+const itemSchema = z.object({
+  categoryId: z.string().cuid(),
+  productId: z.string().cuid().nullable().optional(),
+  recipeId: z.string().cuid().nullable().optional(),
+  name: z.string().trim().min(2).max(120),
+  description: z.string().trim().max(280).nullable().optional(),
+  photoUrl: z.string().trim().max(2000).nullable().optional(),
+  price: z.coerce.number().positive(),
+  temperature: z.enum(["HOT", "COLD", "OTHER"]).default("OTHER"),
+  isVegetarian: z.boolean().default(false),
+  isAvailable: z.boolean().default(true),
+  addonIds: z.array(z.string().cuid()).default([]),
+  // Empty = unallocated = sellable at every location.
+  locationIds: z.array(z.string().cuid()).default([]),
+});
+const addonSchema = z.object({ name: z.string().trim().min(2).max(80), price: z.coerce.number().nonnegative(), isActive: z.boolean().default(true) });
+const itemUpdateSchema = partialNoDefaults(itemSchema);
+const addonUpdateSchema = partialNoDefaults(addonSchema);
 const tenantId = (req: { tenantId?: string }) => { if (!req.tenantId) throw new Error("Tenant context is required"); return req.tenantId; };
 
-menuRouter.get("/categories", async (req, res) => res.json({ categories: await prisma.menuCategory.findMany({ where: { tenantId: tenantId(req) }, include: { items: true }, orderBy: [{ sortOrder: "asc" }, { name: "asc" }] }) }));
-menuRouter.post("/categories", async (req, res) => { const data = categorySchema.safeParse(req.body); if (!data.success) { res.status(400).json({ error: "Invalid category", details: data.error.flatten() }); return; } res.status(201).json({ category: await prisma.menuCategory.create({ data: { tenantId: tenantId(req), ...data.data } }) }); });
-menuRouter.patch("/categories/:id", async (req, res) => { const data = categorySchema.partial().safeParse(req.body); if (!data.success) { res.status(400).json({ error: "Invalid category", details: data.error.flatten() }); return; } const updated = await prisma.menuCategory.updateMany({ where: { id: req.params.id, tenantId: tenantId(req) }, data: data.data }); if (!updated.count) { res.status(404).json({ error: "Category not found" }); return; } res.json({ category: await prisma.menuCategory.findUniqueOrThrow({ where: { id: req.params.id } }) }); });
-menuRouter.delete("/categories/:id", async (req, res) => { const deleted = await prisma.menuCategory.deleteMany({ where: { id: req.params.id, tenantId: tenantId(req) } }); if (!deleted.count) { res.status(404).json({ error: "Category not found" }); return; } res.status(204).send(); });
+const itemInclude = { category: true, product: true, addons: true, locations: { select: { id: true, name: true } }, recipe: { include: { ingredients: { include: { product: true } } } } } as const;
 
-menuRouter.get("/items", async (req, res) => res.json({ items: await prisma.menuItem.findMany({ where: { tenantId: tenantId(req) }, include: { category: true, inventoryItem: true, ingredients: { include: { inventoryItem: { include: { store: true } } } } }, orderBy: { name: "asc" } }) }));
-menuRouter.post("/items", async (req, res) => { const data = itemSchema.safeParse(req.body); if (!data.success) { res.status(400).json({ error: "Invalid menu item", details: data.error.flatten() }); return; } const tid = tenantId(req); const category = await prisma.menuCategory.findFirst({ where: { id: data.data.categoryId, tenantId: tid } }); if (!category) { res.status(400).json({ error: "Choose a category from this property" }); return; } if (data.data.inventoryItemId && !(await prisma.inventoryItem.findFirst({ where: { id: data.data.inventoryItemId, tenantId: tid } }))) { res.status(400).json({ error: "Choose a product from this property" }); return; } const { categoryId, inventoryItemId, ...item } = data.data; res.status(201).json({ item: await prisma.menuItem.create({ data: { ...item, tenant: { connect: { id: tid } }, category: { connect: { id: categoryId } }, ...(inventoryItemId ? { inventoryItem: { connect: { id: inventoryItemId } } } : {}) }, include: { category: true, inventoryItem: true } }) }); });
-menuRouter.patch("/items/:id", async (req, res) => { const data = itemSchema.partial().safeParse(req.body); if (!data.success) { res.status(400).json({ error: "Invalid menu item", details: data.error.flatten() }); return; } const tid = tenantId(req); const existing = await prisma.menuItem.findFirst({ where: { id: req.params.id, tenantId: tid } }); if (!existing) { res.status(404).json({ error: "Menu item not found" }); return; } const { categoryId, inventoryItemId, ...item } = data.data; const updated = await prisma.menuItem.update({ where: { id: existing.id }, data: { ...item, ...(categoryId ? { category: { connect: { id: categoryId } } } : {}), ...(inventoryItemId === null ? { inventoryItem: { disconnect: true } } : inventoryItemId ? { inventoryItem: { connect: { id: inventoryItemId } } } : {}) }, include: { category: true, inventoryItem: true } }); res.json({ item: updated }); });
+menuRouter.get("/items", async (req, res) => res.json({ items: await prisma.menuItem.findMany({ where: { tenantId: tenantId(req) }, include: itemInclude, orderBy: { name: "asc" } }) }));
+menuRouter.post("/items", async (req, res) => {
+  const data = itemSchema.safeParse(req.body);
+  if (!data.success) { res.status(400).json({ error: "Invalid menu item", details: data.error.flatten() }); return; }
+  const tid = tenantId(req);
+  const category = await prisma.category.findFirst({ where: { id: data.data.categoryId, tenantId: tid, scope: "RESTAURANT" } });
+  if (!category) { res.status(400).json({ error: "Choose a menu category from this property" }); return; }
+  if (data.data.productId && !(await prisma.product.findFirst({ where: { id: data.data.productId, tenantId: tid } }))) { res.status(400).json({ error: "Choose a product from this property" }); return; }
+  if (data.data.recipeId && !(await prisma.recipe.findFirst({ where: { id: data.data.recipeId, tenantId: tid } }))) { res.status(400).json({ error: "Choose a recipe from this property" }); return; }
+  if (data.data.addonIds.length) {
+    const count = await prisma.addon.count({ where: { id: { in: data.data.addonIds }, tenantId: tid } });
+    if (count !== new Set(data.data.addonIds).size) { res.status(400).json({ error: "Every add-on must belong to this property" }); return; }
+  }
+  if (data.data.locationIds.length) {
+    const count = await prisma.location.count({ where: { id: { in: data.data.locationIds }, tenantId: tid } });
+    if (count !== new Set(data.data.locationIds).size) { res.status(400).json({ error: "Every location must belong to this property" }); return; }
+  }
+  const { categoryId, productId, recipeId, addonIds, locationIds, ...item } = data.data;
+  res.status(201).json({ item: await prisma.menuItem.create({
+    data: { ...item, tenant: { connect: { id: tid } }, category: { connect: { id: categoryId } }, ...(productId ? { product: { connect: { id: productId } } } : {}), ...(recipeId ? { recipe: { connect: { id: recipeId } } } : {}), addons: { connect: addonIds.map((id) => ({ id })) }, locations: { connect: locationIds.map((id) => ({ id })) } },
+    include: itemInclude,
+  }) });
+});
+menuRouter.patch("/items/:id", async (req, res) => {
+  const data = itemUpdateSchema.safeParse(req.body);
+  if (!data.success) { res.status(400).json({ error: "Invalid menu item", details: data.error.flatten() }); return; }
+  const tid = tenantId(req);
+  const existing = await prisma.menuItem.findFirst({ where: { id: req.params.id, tenantId: tid } });
+  if (!existing) { res.status(404).json({ error: "Menu item not found" }); return; }
+  if (data.data.categoryId && !(await prisma.category.findFirst({ where: { id: data.data.categoryId, tenantId: tid, scope: "RESTAURANT" } }))) { res.status(400).json({ error: "Choose a menu category from this property" }); return; }
+  if (data.data.addonIds) {
+    const count = await prisma.addon.count({ where: { id: { in: data.data.addonIds }, tenantId: tid } });
+    if (count !== new Set(data.data.addonIds).size) { res.status(400).json({ error: "Every add-on must belong to this property" }); return; }
+  }
+  if (data.data.locationIds) {
+    const count = await prisma.location.count({ where: { id: { in: data.data.locationIds }, tenantId: tid } });
+    if (count !== new Set(data.data.locationIds).size) { res.status(400).json({ error: "Every location must belong to this property" }); return; }
+  }
+  const { categoryId, productId, recipeId, addonIds, locationIds, ...item } = data.data;
+  const updated = await prisma.menuItem.update({
+    where: { id: existing.id },
+    data: {
+      ...item,
+      ...(categoryId ? { category: { connect: { id: categoryId } } } : {}),
+      ...(productId === null ? { product: { disconnect: true } } : productId ? { product: { connect: { id: productId } } } : {}),
+      ...(recipeId === null ? { recipe: { disconnect: true } } : recipeId ? { recipe: { connect: { id: recipeId } } } : {}),
+      ...(addonIds ? { addons: { set: addonIds.map((id) => ({ id })) } } : {}),
+      ...(locationIds ? { locations: { set: locationIds.map((id) => ({ id })) } } : {}),
+    },
+    include: itemInclude,
+  });
+  res.json({ item: updated });
+});
 menuRouter.delete("/items/:id", async (req, res) => { const deleted = await prisma.menuItem.deleteMany({ where: { id: req.params.id, tenantId: tenantId(req) } }); if (!deleted.count) { res.status(404).json({ error: "Menu item not found" }); return; } res.status(204).send(); });
-menuRouter.get("/items/:id/ingredients", async (req, res) => { const item = await prisma.menuItem.findFirst({ where: { id: req.params.id, tenantId: tenantId(req) }, include: { ingredients: { include: { inventoryItem: { include: { store: true } } } } } }); if (!item) { res.status(404).json({ error: "Menu item not found" }); return; } res.json({ item, ingredients: item.ingredients }); });
-/** Replaces a menu item's recipe. Products remain ingredients, never saleable finished drinks. */
-menuRouter.put("/items/:id/ingredients", async (req, res) => { const data = ingredientsSchema.safeParse(req.body); if (!data.success) { res.status(400).json({ error: "Invalid recipe", details: data.error.flatten() }); return; } const tid = tenantId(req); const item = await prisma.menuItem.findFirst({ where: { id: req.params.id, tenantId: tid } }); if (!item) { res.status(404).json({ error: "Menu item not found" }); return; } const ingredientIds = data.data.ingredients.map((ingredient) => ingredient.inventoryItemId); if (new Set(ingredientIds).size !== ingredientIds.length) { res.status(400).json({ error: "An ingredient can only appear once in a recipe" }); return; } const count = await prisma.inventoryItem.count({ where: { id: { in: ingredientIds }, tenantId: tid, isActive: true } }); if (count !== ingredientIds.length) { res.status(400).json({ error: "Every ingredient must be an active product from this property" }); return; } const ingredients = await prisma.$transaction(async (tx) => { await tx.menuItemIngredient.deleteMany({ where: { menuItemId: item.id } }); await tx.menuItemIngredient.createMany({ data: data.data.ingredients.map((ingredient) => ({ menuItemId: item.id, ...ingredient })) }); return tx.menuItemIngredient.findMany({ where: { menuItemId: item.id }, include: { inventoryItem: { include: { store: true } } } }); }); res.json({ ingredients }); });
+
+menuRouter.get("/addons", async (req, res) => res.json({ addons: await prisma.addon.findMany({ where: { tenantId: tenantId(req) }, orderBy: { name: "asc" } }) }));
+menuRouter.post("/addons", async (req, res) => { const data = addonSchema.safeParse(req.body); if (!data.success) { res.status(400).json({ error: "Invalid add-on", details: data.error.flatten() }); return; } res.status(201).json({ addon: await prisma.addon.create({ data: { tenantId: tenantId(req), ...data.data } }) }); });
+menuRouter.patch("/addons/:id", async (req, res) => { const data = addonUpdateSchema.safeParse(req.body); if (!data.success) { res.status(400).json({ error: "Invalid add-on", details: data.error.flatten() }); return; } const updated = await prisma.addon.updateMany({ where: { id: req.params.id, tenantId: tenantId(req) }, data: data.data }); if (!updated.count) { res.status(404).json({ error: "Add-on not found" }); return; } res.json({ addon: await prisma.addon.findUniqueOrThrow({ where: { id: req.params.id } }) }); });
+menuRouter.delete("/addons/:id", async (req, res) => { const deleted = await prisma.addon.deleteMany({ where: { id: req.params.id, tenantId: tenantId(req) } }); if (!deleted.count) { res.status(404).json({ error: "Add-on not found" }); return; } res.status(204).send(); });

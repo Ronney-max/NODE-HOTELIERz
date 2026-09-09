@@ -1,0 +1,107 @@
+import { Router } from "express";
+import { Prisma } from "@prisma/client";
+import { z } from "zod";
+import { prisma } from "../../lib/prisma.js";
+import { partialNoDefaults } from "../../lib/zod.js";
+
+// Suppliers/vendors the property buys stock from. A plain definitional
+// lookup for now — Purchases / Goods Received will consume it later — so
+// no requireModule gate, matching assets/expenses/payment-methods.
+export const suppliersRouter = Router();
+
+const blankToUndefined = (v: unknown) => (typeof v === "string" && v.trim() === "" ? undefined : v);
+const optionalText = (max: number) => z.preprocess(blankToUndefined, z.string().trim().max(max).optional());
+const optionalEmail = z.preprocess(blankToUndefined, z.email().optional());
+const optionalNumber = z.preprocess(blankToUndefined, z.coerce.number().finite().optional());
+
+const createSchema = z.object({
+  name: z.string().trim().min(1).max(150),
+  contactPerson: optionalText(120),
+  phone: optionalText(40),
+  email: optionalEmail,
+  address: optionalText(255),
+  city: optionalText(80),
+  taxPin: optionalText(40),
+  paymentTerms: optionalText(120),
+  notes: optionalText(500),
+  // Opening balance only — once purchases/payments drive this, it stops
+  // being user-editable, so it's deliberately left out of updateSchema.
+  balance: optionalNumber,
+  isActive: z.boolean().default(true),
+});
+const updateSchema = partialNoDefaults(createSchema.omit({ balance: true }));
+
+const tenantId = (req: { tenantId?: string }) => {
+  if (!req.tenantId) throw new Error("Tenant context is required");
+  return req.tenantId;
+};
+
+const supplierInclude = {
+  createdByEmployee: { select: { id: true, firstName: true, lastName: true } },
+  updatedByEmployee: { select: { id: true, firstName: true, lastName: true } },
+} as const;
+
+suppliersRouter.get("/", async (req, res) => {
+  const query = z.object({
+    search: optionalText(120),
+    active: z.enum(["true", "false"]).optional(),
+  }).safeParse(req.query);
+  if (!query.success) { res.status(400).json({ error: "Invalid supplier filters", details: query.error.flatten() }); return; }
+  const { search, active } = query.data;
+  const where: Prisma.SupplierWhereInput = {
+    tenantId: tenantId(req),
+    ...(active ? { isActive: active === "true" } : {}),
+    ...(search ? { OR: [
+      { name: { contains: search, mode: "insensitive" } },
+      { contactPerson: { contains: search, mode: "insensitive" } },
+      { phone: { contains: search, mode: "insensitive" } },
+      { email: { contains: search, mode: "insensitive" } },
+    ] } : {}),
+  };
+  const suppliers = await prisma.supplier.findMany({ where, include: supplierInclude, orderBy: { name: "asc" } });
+  const totalBalance = suppliers.reduce((sum, s) => sum + Number(s.balance), 0);
+  res.json({ suppliers, summary: { total: suppliers.length, active: suppliers.filter((s) => s.isActive).length, totalBalance } });
+});
+
+suppliersRouter.get("/:id", async (req, res) => {
+  const supplier = await prisma.supplier.findFirst({ where: { id: req.params.id, tenantId: tenantId(req) }, include: supplierInclude });
+  if (!supplier) { res.status(404).json({ error: "Supplier not found" }); return; }
+  res.json({ supplier });
+});
+
+suppliersRouter.post("/", async (req, res, next) => {
+  const data = createSchema.safeParse(req.body);
+  if (!data.success) { res.status(400).json({ error: "Invalid supplier", details: data.error.flatten() }); return; }
+  try {
+    const supplier = await prisma.supplier.create({
+      data: { tenantId: tenantId(req), createdBy: req.userId, ...data.data },
+      include: supplierInclude,
+    });
+    res.status(201).json({ supplier });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") { res.status(409).json({ error: "A supplier with this name already exists" }); return; }
+    next(error);
+  }
+});
+
+suppliersRouter.patch("/:id", async (req, res, next) => {
+  const data = updateSchema.safeParse(req.body);
+  if (!data.success) { res.status(400).json({ error: "Invalid supplier", details: data.error.flatten() }); return; }
+  const tid = tenantId(req);
+  try {
+    const updated = await prisma.supplier.updateMany({ where: { id: req.params.id, tenantId: tid }, data: { ...data.data, updatedBy: req.userId } });
+    if (!updated.count) { res.status(404).json({ error: "Supplier not found" }); return; }
+    const supplier = await prisma.supplier.findUniqueOrThrow({ where: { id: req.params.id }, include: supplierInclude });
+    res.json({ supplier });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") { res.status(409).json({ error: "A supplier with this name already exists" }); return; }
+    next(error);
+  }
+});
+
+suppliersRouter.delete("/:id", async (req, res) => {
+  const supplier = await prisma.supplier.findFirst({ where: { id: req.params.id, tenantId: tenantId(req) }, select: { id: true } });
+  if (!supplier) { res.status(404).json({ error: "Supplier not found" }); return; }
+  await prisma.supplier.delete({ where: { id: supplier.id } });
+  res.status(204).send();
+});
