@@ -21,17 +21,6 @@ enum ModuleKey {
   REPORTS
 }
 
-enum UserRole {
-  SUPER_ADMIN
-  OWNER
-  MANAGER
-  STAFF
-  BARISTA
-  STORE_KEEPER
-  RECEPTIONIST
-  HOUSEKEEPER
-}
-
 enum DrinkTemperature {
   HOT
   COLD
@@ -245,7 +234,6 @@ model Tenant {
   maxDevices        Int           @default(10)
   lastLicenseCheck  DateTime?
 
-  users              User[]
   tenantModules      TenantModule[]
   cafeSettings       CafeSettings?
   categories         Category[]
@@ -1570,22 +1558,6 @@ model TenantModule {
   module    Module    @relation(fields: [moduleKey], references: [key])
 
   @@unique([tenantId, moduleKey])
-}
-
-model User {
-  id        String   @id @default(cuid())
-  tenantId  String
-  email     String
-  password  String
-  firstName String
-  lastName  String
-  role      UserRole @default(STAFF)
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  @@unique([tenantId, email])
 }
 
 model Session {
